@@ -12,7 +12,7 @@ from sklearn.cluster import KMeans
 import requests
 from aiohttp import web
 
-# Настройки из переменных окружения
+# Настройки
 TOKEN = os.getenv("BOT_TOKEN")
 PRODUCTION_ADDRESS = os.getenv("PRODUCTION_ADDRESS", "Москва, ул. Производственная, 1")
 
@@ -22,7 +22,7 @@ user_data = {}
 
 # --- Мини-сервер для Render ---
 async def handle_health(request):
-    return web.Response(text="Bot is alive")
+    return web.Response(text="Bot is running")
 
 async def start_web_server():
     app = web.Application()
@@ -32,67 +32,69 @@ async def start_web_server():
     site = web.TCPSite(runner, "0.0.0.0", int(os.getenv("PORT", 8080)))
     await site.start()
 
-# --- Улучшенная очистка адреса ---
+# --- Новая мощная очистка адреса ---
 def clean_address(text):
-    # 1. Вырезаем блок между ключевыми фразами
+    # 1. Ищем блок адреса (между ОКПД и Грузополучателем, как ты просил)
+    # Используем широкий захват, так как в PDF текст может "плавать"
     pattern = re.compile(r"Вид деятельности по ОКПД(.*?)Грузополучатель", re.DOTALL | re.IGNORECASE)
     match = pattern.search(text)
+    
     if not match:
-        # Если не нашли по ОКПД, пробуем найти после слова 'Грузополучатель'
-        pattern = re.compile(r"Грузополучатель(.*?)(?:Поставщик|Основание|Номер документа)", re.DOTALL | re.IGNORECASE)
+        # Запасной вариант, если блок смещен
+        pattern = re.compile(r"Грузополучатель(.*?)(?:Поставщик|Основание|Номер)", re.DOTALL | re.IGNORECASE)
         match = pattern.search(text)
-    
+
     if not match:
         return None
 
-    raw_addr = match.group(1).replace('\n', ' ').strip()
+    res = match.group(1).replace('\n', ' ').strip()
+
+    # 2. Удаляем ИНН, КПП, расчетные счета (длинные цифры) и индексы
+    res = re.sub(r'\d{10,25}', '', res) # Банковские реквизиты
+    res = re.sub(r'\b\d{6}\b', '', res) # Индексы
+
+    # 3. Находим начало адреса (отсекаем ИП, ООО и прочее в начале)
+    # Ищем первое упоминание Москвы или города
+    start_match = re.search(r'(?:г\.|г\s|город|москва)', res, re.IGNORECASE)
+    if start_match:
+        res = res[start_match.start():]
+
+    # 4. Форматируем город (убираем г., г, город)
+    res = re.sub(r'^(?:г\.|г\s|город|Город)\s*', '', res, flags=re.IGNORECASE)
+    res = re.sub(r'^Москва\s*', '', res, flags=re.IGNORECASE)
     
-    # Список "мусора", который нужно выкинуть
-    junk_words = [
-        'ИНН', 'КПП', 'вн.тер.г.', 'муниципальный округ', 'административный округ', 
-        'р/с', 'к/с', 'БИК', 'тел.', 'бизнес-центр', 'БЦ', 'этаж', 'офис', 'помещение'
+    # 5. Чистим мусорные слова (округа, районы, административные данные)
+    junk = [
+        r'вн\.тер\.г\.', r'муниципальный округ', r'административный округ', 
+        r'помещение', r'офис', r'этаж', r'бизнес-центр', r'БЦ', r'ИНН', r'КПП'
     ]
+    for pattern in junk:
+        res = re.sub(pattern, '', res, flags=re.IGNORECASE)
+
+    # 6. Стандартизируем "ул."
+    # Если есть "ул" без точки, ставим точку
+    res = re.sub(r'\bул\b(?!\.)', 'ул.', res, flags=re.IGNORECASE)
     
-    # Признаки того, что часть строки является адресом
-    address_markers = ['ул', 'д.', 'стр', 'корп', 'пр-т', 'проспект', 'пер', 'проезд', 'шоссе', 'наб', 'тупик']
+    # 7. Форматируем дома и корпуса
+    # Убираем "д." или "дом" перед номером дома
+    res = re.sub(r',\s*(?:д\.|дом)\s*', ', ', res, flags=re.IGNORECASE)
+    # Склеиваем корпус: "102, корп. 1" -> "102к1" или "102 корп 1" -> "102к1"
+    res = re.sub(r'[, ]*(?:корп\.?|к\.)\s*(\d+)', r'к\1', res, flags=re.IGNORECASE)
+    # Убираем "стр." (оставляем как есть, но чистим пробелы)
+    res = re.sub(r'\s*стр\.\s*', ', стр. ', res, flags=re.IGNORECASE)
 
-    # Разбиваем по запятым и фильтруем
-    parts = raw_addr.split(',')
-    clean_parts = []
+    # 8. Финальная сборка
+    # Убираем двойные запятые и лишние пробелы
+    res = re.sub(r'\s+', ' ', res)
+    res = re.sub(r'[,]{2,}', ',', res)
+    res = res.strip(' ,.()')
     
-    for p in parts:
-        p_clean = p.strip()
-        # Пропускаем, если в части есть ИНН или р/с (длинные цифры)
-        if re.search(r'\d{10,}', p_clean):
-            continue
-        # Пропускаем пустые или слишком короткие части (например, точки или КПП)
-        if len(p_clean) < 2 or p_clean.lower() in ['инн', 'кпп']:
-            continue
-        # Убираем конкретные мусорные фразы
-        for junk in junk_words:
-            p_clean = re.sub(rf'{junk}.*?\s', '', p_clean, flags=re.IGNORECASE).strip()
-            p_clean = p_clean.replace(junk, "").strip()
-
-        # Оставляем только те части, где есть "Москва" или маркеры улицы/дома
-        if "москва" in p_clean.lower() or any(m in p_clean.lower() for m in address_markers):
-            # Финальная чистка от лишних знаков в начале/конце части
-            p_clean = re.sub(r'^[^а-яА-Я0-9]+|[^а-яА-Я0-9]+$', '', p_clean)
-            if p_clean:
-                clean_parts.append(p_clean)
-
-    if not clean_parts:
-        return None
-
-    # Собираем обратно. Гарантируем, что "Москва" в начале.
-    final = ", ".join(clean_parts)
-    if "Москва" not in final:
-        final = "Москва, " + final
-        
-    return final
+    # Всегда добавляем Москву в начало
+    return f"Москва, {res}"
 
 def get_coords(address):
     try:
-        geolocator = Nominatim(user_agent="logistics_bot_v3")
+        geolocator = Nominatim(user_agent="logistic_v4_geocoder")
         location = geolocator.geocode(address, timeout=10)
         return (location.latitude, location.longitude) if location else None
     except:
@@ -104,7 +106,7 @@ async def start(message: types.Message):
     user_data[message.from_user.id] = {'addresses': []}
     kb = [[KeyboardButton(text="🚚 Начать обработку накладных")]]
     markup = ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
-    await message.answer("Сбрасывай PDF-накладные. Я очищу адреса от мусора и построю маршрут.", reply_markup=markup)
+    await message.answer("Пришли мне PDF. Я почищу адреса по новому алгоритму.", reply_markup=markup)
 
 @dp.message(F.document)
 async def handle_docs(message: types.Message):
@@ -126,9 +128,9 @@ async def handle_docs(message: types.Message):
                 if message.from_user.id not in user_data:
                     user_data[message.from_user.id] = {'addresses': []}
                 user_data[message.from_user.id]['addresses'].append(addr)
-                await message.answer(f"📍 Очищенный адрес:\n`{addr}`", parse_mode="Markdown")
+                await message.answer(f"✅ **Адрес принят:**\n`{addr}`", parse_mode="Markdown")
             else:
-                await message.answer(f"❓ Не удалось вычленить адрес из {message.document.file_name}")
+                await message.answer(f"❌ Не нашел адрес в {message.document.file_name}")
     finally:
         if os.path.exists(temp_fn):
             os.remove(temp_fn)
@@ -148,33 +150,39 @@ async def ask_drivers(message: types.Message):
 async def process_logistics(message: types.Message):
     num_drivers = int(message.text)
     user_id = message.from_user.id
-    # Очистка дублей
     raw_addresses = list(set(user_data[user_id]['addresses']))
     
-    await message.answer("🔄 Геокодирую и считаю маршруты...")
+    await message.answer("🔄 Строю маршруты... Это может занять до минуты.")
     
     data = []
     for addr in raw_addresses:
         coords = get_coords(addr)
         if coords:
             data.append({'address': addr, 'lat': coords[0], 'lon': coords[1]})
-        await asyncio.sleep(1.1) # Лимит Nominatim
+        else:
+            # Если точный адрес не найден, пробуем без номера дома/корпуса для геокодинга
+            simple_addr = addr.split(',')[0] + "," + addr.split(',')[1]
+            coords = get_coords(simple_addr)
+            if coords:
+                data.append({'address': addr, 'lat': coords[0], 'lon': coords[1]})
+        await asyncio.sleep(1)
 
-    if len(data) < num_drivers:
-        await message.answer(f"Слишком мало найденных адресов ({len(data)}) для {num_drivers} водителей.")
+    if len(data) < 1:
+        await message.answer("Не удалось найти координаты адресов.")
         return
 
     df = pd.DataFrame(data)
-    kmeans = KMeans(n_clusters=num_drivers, n_init=10).fit(df[['lat', 'lon']])
+    n_cl = min(num_drivers, len(df))
+    kmeans = KMeans(n_clusters=n_cl, n_init=10).fit(df[['lat', 'lon']])
     df['driver'] = kmeans.labels_
 
-    for i in range(num_drivers):
+    for i in range(n_cl):
         driver_points = df[df['driver'] == i]
-        result = f"🚚 **МАРШРУТ ВОДИТЕЛЯ №{i+1}**\n"
+        result = f"🚛 **МАРШРУТ ВОДИТЕЛЯ №{i+1}**\n"
         for _, row in driver_points.iterrows():
-            # Для водителя убираем город для компактности
-            short = row['address'].replace("Москва, ", "").replace("г. Москва, ", "")
-            result += f"• {short}\n"
+            # Убираем "Москва, " для списка водителю
+            final_view = row['address'].replace("Москва, ", "")
+            result += f"📍 {final_view}\n"
         await message.answer(result, parse_mode="Markdown")
 
     user_data[user_id] = {'addresses': []}
