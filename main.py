@@ -69,7 +69,7 @@ def clean_address(text):
     clean_parts = []
     seen_moscow = False
     street_detected = False
-    last_was_street_name = False  # Для отслеживания, была ли предыдущая часть названием улицы
+    last_was_street_name = False
 
     for i, p in enumerate(parts):
         p_clean = p.strip()
@@ -141,84 +141,49 @@ def clean_address(text):
         res = "Москва, " + res.lstrip(" ,")
 
     # 6. ФИНАЛЬНОЕ ФОРМАТИРОВАНИЕ
-    # Удаление двойных "ул."
     res = re.sub(r'ул\.\s+ул\.', 'ул.', res, flags=re.IGNORECASE)
-    
-    # Удаление двойных точек и лишних пробелов в "ул.."
     res = re.sub(r'ул\.\.', 'ул.', res, flags=re.IGNORECASE)
-    
-    # Унификация обозначений улиц
     res = re.sub(r'\bул\b(?!\.)', 'ул.', res, flags=re.IGNORECASE)
     res = re.sub(r'\bпер\b(?!\.)', 'пер.', res, flags=re.IGNORECASE)
-    
-    # Преобразование сокращений
     res = re.sub(r'\bпр-т\b', 'проспект', res, flags=re.IGNORECASE)
     res = re.sub(r'\bнаб\.\b', 'набережная', res, flags=re.IGNORECASE)
     
-    # Удаление "д." и "дом" - многоступенчатый подход
-    # 1. Удаляем в начале строки
+    # Удаление "д." и "дом"
     res = re.sub(r'^д\.|^дом\s+', '', res, flags=re.IGNORECASE)
-    # 2. Удаляем после запятой
     res = re.sub(r',\s*д\.\s*', ', ', res, flags=re.IGNORECASE)
     res = re.sub(r',\s*дом\s*', ', ', res, flags=re.IGNORECASE)
-    # 3. Удаляем в середине строки
     res = re.sub(r'\s+д\.\s+', ' ', res, flags=re.IGNORECASE)
     res = re.sub(r'\s+дом\s+', ' ', res, flags=re.IGNORECASE)
-    
-    # Удаление "д." перед номерами
     res = re.sub(r'д\.(\d+)', r'\1', res, flags=re.IGNORECASE)
     res = re.sub(r'дом(\d+)', r'\1', res, flags=re.IGNORECASE)
     
     # Объединение номера дома и корпуса/строения
     res = re.sub(r'(\d+[А-Яа-я]?)\s*[,]?\s*(?:корп\.?|к\.?|к)\s*(\d+)', r'\1к\2', res, flags=re.IGNORECASE)
     res = re.sub(r'(\d+[А-Яа-я]?)\s*[,]?\s*(?:стр\.?|строение|с\.?)\s*(\d+)', r'\1 стр. \2', res, flags=re.IGNORECASE)
-    
-    # Объединение буквы с номером дома
     res = re.sub(r'(\d+)\s+([А-Яа-я])\b', r'\1\2', res)
     
-    # Разделение названия улицы и номера дома, если они слиты
-    # Универсальный паттерн для всех типов улиц
+    # Разделение названия улицы и номера дома
     res = re.sub(r'([а-яА-ЯёЁ]{2,}(?:\s+[а-яА-ЯёЁ]+){0,3})\s+(\d+[а-яА-Я]?\d*(?:к\d+)?)', r'\1, \2', res)
     
     # Удаление лишних запятых и пробелов
     res = re.sub(r'\s+', ' ', res)
     res = re.sub(r'[,]{2,}', ',', res)
     res = re.sub(r',\s*,', ', ', res)
-    
-    # Удаление запятой перед корпусом/строением
     res = re.sub(r',\s*(к\d+|стр\.\s*\d+)', r' \1', res)
-    
-    # Удаление "д." в конце адреса
     res = re.sub(r',\s*д\.\s*$', '', res, flags=re.IGNORECASE)
-    
-    # Исправление для адресов типа "ул. Проспект Мира" - убираем лишнее "ул."
     res = re.sub(r'ул\.\s+(проспект|пер\.|бульвар|шоссе|набережная|пл\.)', r'\1', res, flags=re.IGNORECASE)
-    
-    # Исправление для адресов типа "Университетский проспект д, 23к1" - убираем "д,"
     res = re.sub(r'\b(проспект|ул\.|пер\.|бульвар|шоссе|набережная)\s+д\s*,', r'\1,', res, flags=re.IGNORECASE)
-    
-    # Исправление для адресов типа "1-ая Останкинская ул.." - убираем лишние точки
     res = re.sub(r'ул\.\.', 'ул.', res)
-    
-    # Удаление лишних запятых
     res = re.sub(r',\s*,', ',', res)
-    
-    # Финальная чистка - убираем двойные пробелы
     res = re.sub(r'\s+', ' ', res).strip()
-    
-    # Удаление запятых в начале
     res = re.sub(r'^,\s*', '', res)
     
     # Проверка, что у нас есть улица в адресе
-    # Если адрес содержит только "Москва, 39к1" - добавляем ул. к следующей части
     if re.match(r'^Москва,\s*\d', res):
-        # Находим первую часть после Москвы
         match = re.match(r'^Москва,\s*([^,]+)', res)
         if match:
             after_moscow = match.group(1)
-            # Если это не похоже на улицу, а похоже на номер дома
             if re.match(r'^\d', after_moscow):
-                # Ищем в исходном тексте название улицы
                 street_match = re.search(r'([А-Яа-яёЁ]+\s+[А-Яа-яёЁ]+)(?=\s*\d)', raw)
                 if street_match:
                     street_name = street_match.group(1)
@@ -241,7 +206,11 @@ async def start(message: types.Message):
 
 @dp.message(F.document)
 async def handle_docs(message: types.Message):
-    if not message.document.file_name.lower().endswith('.pdf'): return
+    if not message.document.file_name.lower().endswith('.pdf'): 
+        return
+    
+    # Показываем индикатор загрузки
+    processing_msg = await message.answer("📄 *Обработка документа...*", parse_mode="Markdown")
     
     uid = str(uuid.uuid4())
     temp_fn = f"temp_{uid}.pdf"
@@ -252,62 +221,145 @@ async def handle_docs(message: types.Message):
             text = "".join([p.extract_text() or "" for p in pdf.pages])
             addr = clean_address(text)
             
-            await asyncio.sleep(0.5)
+            # Удаляем сообщение об обработке
+            await processing_msg.delete()
 
             if addr:
-                if message.from_user.id not in user_data: user_data[message.from_user.id] = {'addresses': []}
+                if message.from_user.id not in user_data: 
+                    user_data[message.from_user.id] = {'addresses': []}
                 user_data[message.from_user.id]['addresses'].append(addr)
-                await message.answer(f"✅ **Адрес:**\n`{addr}`", parse_mode="Markdown")
+                
+                # Считаем количество адресов
+                total_addresses = len(user_data[message.from_user.id]['addresses'])
+                
+                await message.answer(
+                    f"✅ **Адрес добавлен:**\n`{addr}`\n\n"
+                    f"📊 Всего адресов: {total_addresses}",
+                    parse_mode="Markdown"
+                )
+                
+                # Автоматически запрашиваем количество водителей
+                await ask_drivers_auto(message)
             else:
                 await message.answer(f"❌ Ошибка распознавания в {message.document.file_name}")
+    except Exception as e:
+        # Удаляем сообщение об обработке даже в случае ошибки
+        try:
+            await processing_msg.delete()
+        except:
+            pass
+        await message.answer(f"❌ Ошибка при обработке файла: {str(e)}")
     finally:
-        if os.path.exists(temp_fn): os.remove(temp_fn)
+        if os.path.exists(temp_fn): 
+            os.remove(temp_fn)
+
+async def ask_drivers_auto(message: types.Message):
+    """Автоматический запрос количества водителей"""
+    u_id = message.from_user.id
+    
+    if u_id not in user_data or not user_data[u_id]['addresses']:
+        return
+    
+    # Даем небольшую паузу перед запросом
+    await asyncio.sleep(0.5)
+    
+    total_addresses = len(user_data[u_id]['addresses'])
+    kb = [[KeyboardButton(text=str(i)) for i in range(1, 4)], 
+          [KeyboardButton(text=str(i)) for i in range(4, 7)]]
+    markup = ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
+    
+    await message.answer(
+        f"📦 *Обработка завершена!*\n"
+        f"📊 Всего адресов: {total_addresses}\n\n"
+        f"🚚 *На скольких водителей распределить адреса?*",
+        reply_markup=markup,
+        parse_mode="Markdown"
+    )
 
 @dp.message(F.text == "🚚 Начать обработку накладных")
-async def ask_drivers(message: types.Message):
+async def ask_drivers_manual(message: types.Message):
+    """Ручной запрос количества водителей (по кнопке)"""
     u_id = message.from_user.id
     if u_id not in user_data or not user_data[u_id]['addresses']:
-        await message.answer("Сначала пришли PDF!"); return
-    kb = [[KeyboardButton(text=str(i)) for i in range(1, 4)], [KeyboardButton(text=str(i)) for i in range(4, 7)]]
+        await message.answer("❌ Сначала пришлите PDF-файлы с накладными!")
+        return
+    
+    total_addresses = len(user_data[u_id]['addresses'])
+    kb = [[KeyboardButton(text=str(i)) for i in range(1, 4)], 
+          [KeyboardButton(text=str(i)) for i in range(4, 7)]]
     markup = ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
-    await message.answer(f"Адресов: {len(user_data[u_id]['addresses'])}. Водителей?", reply_markup=markup)
+    
+    await message.answer(
+        f"📊 Всего адресов: {total_addresses}\n"
+        f"🚚 *На скольких водителей распределить адреса?*",
+        reply_markup=markup,
+        parse_mode="Markdown"
+    )
 
 @dp.message(F.text.regexp(r'^\d+$'))
 async def process_logistics(message: types.Message):
     num_drivers = int(message.text)
     user_id = message.from_user.id
+    
+    if user_id not in user_data or not user_data[user_id]['addresses']:
+        await message.answer("❌ Нет адресов для обработки!")
+        return
+    
     raw_addresses = list(set(user_data[user_id]['addresses']))
     
-    progress = await message.answer("🔄 Строю маршруты...")
+    # Показываем индикатор обработки маршрутов
+    progress_msg = await message.answer("🗺️ *Строю оптимальные маршруты...*", parse_mode="Markdown")
     
+    # Показываем индикатор поиска местоположения
     await bot.send_chat_action(message.chat.id, "find_location")
 
     data = []
     for addr in raw_addresses:
         coords = get_coords(addr)
-        if not coords: coords = get_coords(", ".join(addr.split(',')[:2]))
-        if coords: data.append({'address': addr, 'lat': coords[0], 'lon': coords[1]})
+        if not coords: 
+            coords = get_coords(", ".join(addr.split(',')[:2]))
+        if coords: 
+            data.append({'address': addr, 'lat': coords[0], 'lon': coords[1]})
         
+        # Пауза для геокодера
         await asyncio.sleep(1.1)
 
     if not data:
-        await progress.edit_text("❌ Ошибка поиска на карте."); return
+        await progress_msg.edit_text("❌ Ошибка поиска координат на карте.")
+        return
 
     df = pd.DataFrame(data)
     n_cl = min(num_drivers, len(df))
     kmeans = KMeans(n_clusters=n_cl, n_init=10).fit(df[['lat', 'lon']])
     df['driver'] = kmeans.labels_
 
-    await progress.delete()
+    # Обновляем сообщение о прогрессе
+    await progress_msg.edit_text("✅ *Маршруты построены!*\n📋 *Распределение по водителям:*", parse_mode="Markdown")
 
+    # Отправляем маршруты
     for i in range(n_cl):
         driver_points = df[df['driver'] == i]
-        res = f"🚛 **МАРШРУТ №{i+1}**\n"
+        res = f"🚛 *МАРШРУТ №{i+1}*\n"
         for _, row in driver_points.iterrows():
             final_view = row['address'].replace("Москва, ", "")
             res += f"📍 {final_view}\n"
         await message.answer(res, parse_mode="Markdown")
+    
+    # Показываем статистику
+    stats = f"📊 *Статистика распределения:*\n"
+    stats += f"• Всего адресов: {len(raw_addresses)}\n"
+    stats += f"• Количество водителей: {n_cl}\n"
+    for i in range(n_cl):
+        driver_count = len(df[df['driver'] == i])
+        stats += f"• Водитель {i+1}: {driver_count} адрес(ов)\n"
+    
+    await message.answer(stats, parse_mode="Markdown")
+    
+    # Очищаем данные пользователя
     user_data[user_id] = {'addresses': []}
+    
+    # Удаляем сообщение о прогрессе
+    await progress_msg.delete()
 
 async def main():
     await asyncio.gather(start_web_server(), dp.start_polling(bot))
