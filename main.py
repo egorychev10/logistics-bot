@@ -69,8 +69,9 @@ def clean_address(text):
     clean_parts = []
     seen_moscow = False
     street_detected = False
+    last_was_street_name = False  # Для отслеживания, была ли предыдущая часть названием улицы
 
-    for p in parts:
+    for i, p in enumerate(parts):
         p_clean = p.strip()
         # Удаляем "г."
         p_clean = re.sub(r'\b(г\.|г|город)\b\.?\s*', '', p_clean, flags=re.IGNORECASE)
@@ -87,18 +88,33 @@ def clean_address(text):
         # Убираем ФИО
         p_clean = re.sub(r'^([А-ЯЁ][а-яё]+\s*){2,3}', '', p_clean).strip()
         
+        if not p_clean: continue
+        
+        # Определяем, является ли часть номером дома/корпусом
+        is_house_number = re.match(r'^\d+[а-яА-Я]?$', p_clean) or re.match(r'^\d+к\d+$', p_clean) or re.match(r'^\d+\s*стр\.', p_clean, re.IGNORECASE)
+        is_building = re.match(r'^(к|корп|стр|строение|с)\.?\s*\d*', p_clean, re.IGNORECASE)
+        
+        # Если это номер дома или корпус, добавляем без изменений
+        if is_house_number or is_building:
+            clean_parts.append(p_clean)
+            last_was_street_name = False
+            continue
+        
         # Определяем, является ли часть улицей (содержит ключевые слова улиц)
         is_street_type = re.search(r'\b(ул|улица|пр-т|проспект|пер|переулок|наб|набережная|б-р|бульвар|ш|шоссе)\b', p_clean, re.IGNORECASE)
         
-        # Если это тип улицы, но без слова "ул." - добавляем
-        if is_street_type and not p_clean.lower().startswith('ул'):
+        # Если это тип улицы
+        if is_street_type:
             street_type = is_street_type.group(1).lower()
             if street_type in ['ул', 'улица']:
                 p_clean = re.sub(r'\b(ул|улица)\b', 'ул.', p_clean, flags=re.IGNORECASE)
-                street_detected = True
+            clean_parts.append(p_clean)
+            street_detected = True
+            last_was_street_name = False
+            continue
         
         # Если это явно название улицы без указания типа - добавляем "ул."
-        elif not street_detected and not re.match(r'^\d', p_clean) and len(p_clean.split()) >= 1:
+        if not street_detected and not re.match(r'^\d', p_clean) and len(p_clean.split()) >= 1:
             # Проверяем, не содержит ли уже тип улицы
             if not re.search(r'\b(ул\.|проспект|пер\.|бульвар|шоссе|набережная|пл\.)\b', p_clean, re.IGNORECASE):
                 # Добавляем "ул." только если это похоже на название улицы
@@ -107,9 +123,17 @@ def clean_address(text):
                     if not re.match(r'^\d+[а-я]?$', p_clean) and not re.match(r'^(к|корп|стр|строение|с)', p_clean, re.IGNORECASE):
                         p_clean = f"ул. {p_clean}"
                         street_detected = True
+                        last_was_street_name = True
+        elif last_was_street_name and re.match(r'^[А-Яа-яёЁ]+', p_clean):
+            # Если предыдущая часть была названием улицы, а текущая тоже начинается с букв,
+            # то это продолжение названия улицы
+            if clean_parts and clean_parts[-1].startswith('ул.'):
+                clean_parts[-1] = clean_parts[-1] + ' ' + p_clean
+                continue
         
         if len(p_clean) > 0:
             clean_parts.append(p_clean)
+            last_was_street_name = False
 
     # Сборка
     res = ", ".join(clean_parts)
@@ -131,33 +155,30 @@ def clean_address(text):
     res = re.sub(r'\bпр-т\b', 'проспект', res, flags=re.IGNORECASE)
     res = re.sub(r'\bнаб\.\b', 'набережная', res, flags=re.IGNORECASE)
     
-    # Удаление "д." и "дом" в разных позициях
-    # Удаляем в начале адресной части
-    res = re.sub(r'^д\.|дом\s+', '', res, flags=re.IGNORECASE)
-    # Удаляем после запятой
-    res = re.sub(r',\s*(?:д\.|дом)\s+', ', ', res, flags=re.IGNORECASE)
-    # Удаляем перед номером дома (но сохраняем буквы дома, например "2В")
-    res = re.sub(r'\s+(?:д\.|дом)\s+(\d+[А-Яа-я]?)', r' \1', res, flags=re.IGNORECASE)
+    # Удаление "д." и "дом" - многоступенчатый подход
+    # 1. Удаляем в начале строки
+    res = re.sub(r'^д\.|^дом\s+', '', res, flags=re.IGNORECASE)
+    # 2. Удаляем после запятой
+    res = re.sub(r',\s*д\.\s*', ', ', res, flags=re.IGNORECASE)
+    res = re.sub(r',\s*дом\s*', ', ', res, flags=re.IGNORECASE)
+    # 3. Удаляем в середине строки
+    res = re.sub(r'\s+д\.\s+', ' ', res, flags=re.IGNORECASE)
+    res = re.sub(r'\s+дом\s+', ' ', res, flags=re.IGNORECASE)
     
-    # Удаление запятой перед номером дома, которая стоит после названия улицы
-    res = re.sub(r'([а-яё])(?:\s*,\s*)(\d+)', r'\1, \2', res, flags=re.IGNORECASE)
+    # Удаление "д." перед номерами
+    res = re.sub(r'д\.(\d+)', r'\1', res, flags=re.IGNORECASE)
+    res = re.sub(r'дом(\d+)', r'\1', res, flags=re.IGNORECASE)
     
     # Объединение номера дома и корпуса/строения
-    res = re.sub(r'(\d+[А-Яа-я]?)\s*[,]?\s*(?:корп\.?|к\.?|к|ул\.\s+корп)\s*(\d+)', r'\1к\2', res, flags=re.IGNORECASE)
+    res = re.sub(r'(\d+[А-Яа-я]?)\s*[,]?\s*(?:корп\.?|к\.?|к)\s*(\d+)', r'\1к\2', res, flags=re.IGNORECASE)
     res = re.sub(r'(\d+[А-Яа-я]?)\s*[,]?\s*(?:стр\.?|строение|с\.?)\s*(\d+)', r'\1 стр. \2', res, flags=re.IGNORECASE)
     
     # Объединение буквы с номером дома
     res = re.sub(r'(\d+)\s+([А-Яа-я])\b', r'\1\2', res)
     
     # Разделение названия улицы и номера дома, если они слиты
-    # Сначала для случаев с "ул."
-    res = re.sub(r'(ул\.\s+[^,]+?)\s+(\d+[а-яА-Я]?\d*(?:к\d+)?)', r'\1, \2', res, flags=re.IGNORECASE)
-    # Затем для проспектов
-    res = re.sub(r'(проспект\s+[^,]+?)\s+(\d+[а-яА-Я]?\d*(?:к\d+)?)', r'\1, \2', res, flags=re.IGNORECASE)
-    # Для переулков
-    res = re.sub(r'(пер\.\s+[^,]+?)\s+(\d+[а-яА-Я]?\d*(?:к\d+)?)', r'\1, \2', res, flags=re.IGNORECASE)
-    # Для проездов
-    res = re.sub(r'(проезд\s+[^,]+?)\s+(\d+[а-яА-Я]?\d*(?:к\d+)?)', r'\1, \2', res, flags=re.IGNORECASE)
+    # Универсальный паттерн для всех типов улиц
+    res = re.sub(r'([а-яА-ЯёЁ]{2,}(?:\s+[а-яА-ЯёЁ]+){0,3})\s+(\d+[а-яА-Я]?\d*(?:к\d+)?)', r'\1, \2', res)
     
     # Удаление лишних запятых и пробелов
     res = re.sub(r'\s+', ' ', res)
@@ -182,8 +203,26 @@ def clean_address(text):
     # Удаление лишних запятых
     res = re.sub(r',\s*,', ',', res)
     
-    # Финальная чистка
+    # Финальная чистка - убираем двойные пробелы
     res = re.sub(r'\s+', ' ', res).strip()
+    
+    # Удаление запятых в начале
+    res = re.sub(r'^,\s*', '', res)
+    
+    # Проверка, что у нас есть улица в адресе
+    # Если адрес содержит только "Москва, 39к1" - добавляем ул. к следующей части
+    if re.match(r'^Москва,\s*\d', res):
+        # Находим первую часть после Москвы
+        match = re.match(r'^Москва,\s*([^,]+)', res)
+        if match:
+            after_moscow = match.group(1)
+            # Если это не похоже на улицу, а похоже на номер дома
+            if re.match(r'^\d', after_moscow):
+                # Ищем в исходном тексте название улицы
+                street_match = re.search(r'([А-Яа-яёЁ]+\s+[А-Яа-яёЁ]+)(?=\s*\d)', raw)
+                if street_match:
+                    street_name = street_match.group(1)
+                    res = f"Москва, ул. {street_name}, {after_moscow}"
     
     return res.strip(' ,.')
 
