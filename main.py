@@ -3,12 +3,14 @@ import re
 import asyncio
 import pdfplumber
 import pandas as pd
+import numpy as np
 import uuid
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
 from geopy.geocoders import Nominatim
 from sklearn.cluster import KMeans
+from scipy.spatial.distance import cdist
 from aiohttp import web
 
 TOKEN = os.getenv("BOT_TOKEN")
@@ -197,7 +199,93 @@ def get_coords(address):
         geolocator = Nominatim(user_agent="logistic_v17_stable")
         location = geolocator.geocode(address, timeout=10)
         return (location.latitude, location.longitude) if location else None
-    except: return None
+    except: 
+        return None
+
+def balanced_kmeans_clustering(df, n_clusters):
+    """
+    Балансированная кластеризация с примерным равенством точек в кластерах
+    """
+    if n_clusters <= 1 or len(df) <= n_clusters:
+        return KMeans(n_clusters=n_clusters, n_init=10).fit(df[['lat', 'lon']]).labels_
+    
+    # Стандартная KMeans кластеризация
+    kmeans = KMeans(n_clusters=n_clusters, n_init=10)
+    labels = kmeans.fit_predict(df[['lat', 'lon']])
+    
+    # Балансировка кластеров
+    cluster_counts = pd.Series(labels).value_counts()
+    max_count = cluster_counts.max()
+    min_count = cluster_counts.min()
+    
+    # Если разница между самым большим и самым маленьким кластером > 2, балансируем
+    if max_count - min_count > 2:
+        centroids = kmeans.cluster_centers_
+        
+        # Находим точки, которые можно переместить
+        for _ in range(10):  # Ограничим количество итераций
+            cluster_counts = pd.Series(labels).value_counts()
+            max_cluster = cluster_counts.idxmax()
+            min_cluster = cluster_counts.idxmin()
+            
+            if cluster_counts[max_cluster] - cluster_counts[min_cluster] <= 2:
+                break
+            
+            # Находим точку в самом большом кластере, ближайшую к центроиду самого маленького
+            max_cluster_points = df[labels == max_cluster]
+            min_centroid = centroids[min_cluster]
+            
+            # Вычисляем расстояния от точек большого кластера до центроида маленького
+            distances = cdist(max_cluster_points[['lat', 'lon']], [min_centroid])
+            
+            # Находим индекс ближайшей точки
+            nearest_idx = distances.argmin()
+            
+            # Перемещаем точку
+            point_idx = max_cluster_points.iloc[[nearest_idx]].index[0]
+            labels[point_idx] = min_cluster
+    
+    return labels
+
+def build_optimal_route(points_coords):
+    """
+    Строит оптимальный маршрут для заданных точек методом ближайшего соседа
+    """
+    if len(points_coords) <= 1:
+        return list(range(len(points_coords)))
+    
+    n_points = len(points_coords)
+    visited = [False] * n_points
+    route = []
+    
+    # Начинаем с первой точки (условно считаем ее стартовой)
+    current = 0
+    route.append(current)
+    visited[current] = True
+    
+    for _ in range(n_points - 1):
+        # Находим ближайшую непосещенную точку
+        min_dist = float('inf')
+        nearest_idx = -1
+        
+        for i in range(n_points):
+            if not visited[i]:
+                # Вычисляем евклидово расстояние
+                dist = np.sqrt(
+                    (points_coords[i][0] - points_coords[current][0])**2 +
+                    (points_coords[i][1] - points_coords[current][1])**2
+                )
+                
+                if dist < min_dist:
+                    min_dist = dist
+                    nearest_idx = i
+        
+        if nearest_idx != -1:
+            current = nearest_idx
+            route.append(current)
+            visited[current] = True
+    
+    return route
 
 @dp.message(Command("start"))
 async def start(message: types.Message):
@@ -264,14 +352,23 @@ async def ask_drivers_auto(message: types.Message):
     await asyncio.sleep(0.5)
     
     total_addresses = len(user_data[u_id]['addresses'])
-    kb = [[KeyboardButton(text=str(i)) for i in range(1, 4)], 
-          [KeyboardButton(text=str(i)) for i in range(4, 7)]]
+    # Определяем максимальное количество водителей (не более количества адресов и не более 6)
+    max_drivers = min(total_addresses, 6)
+    
+    # Создаем клавиатуру в зависимости от количества адресов
+    kb = []
+    if max_drivers >= 1:
+        kb.append([KeyboardButton(text=str(i)) for i in range(1, min(4, max_drivers + 1))])
+    if max_drivers >= 4:
+        kb.append([KeyboardButton(text=str(i)) for i in range(4, max_drivers + 1)])
+    
     markup = ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
     
     await message.answer(
         f"📦 *Обработка завершена!*\n"
         f"📊 Всего адресов: {total_addresses}\n\n"
-        f"🚚 *На скольких водителей распределить адреса?*",
+        f"🚚 *На скольких водителей распределить адреса?*\n"
+        f"(Выберите от 1 до {max_drivers})",
         reply_markup=markup,
         parse_mode="Markdown"
     )
@@ -285,13 +382,22 @@ async def ask_drivers_manual(message: types.Message):
         return
     
     total_addresses = len(user_data[u_id]['addresses'])
-    kb = [[KeyboardButton(text=str(i)) for i in range(1, 4)], 
-          [KeyboardButton(text=str(i)) for i in range(4, 7)]]
+    # Определяем максимальное количество водителей (не более количества адресов и не более 6)
+    max_drivers = min(total_addresses, 6)
+    
+    # Создаем клавиатуру в зависимости от количества адресов
+    kb = []
+    if max_drivers >= 1:
+        kb.append([KeyboardButton(text=str(i)) for i in range(1, min(4, max_drivers + 1))])
+    if max_drivers >= 4:
+        kb.append([KeyboardButton(text=str(i)) for i in range(4, max_drivers + 1)])
+    
     markup = ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
     
     await message.answer(
         f"📊 Всего адресов: {total_addresses}\n"
-        f"🚚 *На скольких водителей распределить адреса?*",
+        f"🚚 *На скольких водителей распределить адреса?*\n"
+        f"(Выберите от 1 до {max_drivers})",
         reply_markup=markup,
         parse_mode="Markdown"
     )
@@ -305,6 +411,15 @@ async def process_logistics(message: types.Message):
         await message.answer("❌ Нет адресов для обработки!")
         return
     
+    total_addresses = len(user_data[user_id]['addresses'])
+    if num_drivers > total_addresses:
+        await message.answer(f"❌ Количество водителей ({num_drivers}) не может быть больше количества адресов ({total_addresses})!")
+        return
+    
+    if num_drivers > 6:
+        await message.answer("❌ Максимальное количество водителей - 6!")
+        return
+    
     raw_addresses = list(set(user_data[user_id]['addresses']))
     
     # Показываем индикатор обработки маршрутов
@@ -313,13 +428,19 @@ async def process_logistics(message: types.Message):
     # Показываем индикатор поиска местоположения
     await bot.send_chat_action(message.chat.id, "find_location")
 
+    # Собираем координаты
     data = []
     for addr in raw_addresses:
         coords = get_coords(addr)
         if not coords: 
-            coords = get_coords(", ".join(addr.split(',')[:2]))
+            # Пробуем геокодировать только название улицы
+            street_part = ', '.join(addr.split(',')[:2])
+            coords = get_coords(street_part)
         if coords: 
             data.append({'address': addr, 'lat': coords[0], 'lon': coords[1]})
+        else:
+            # Если не нашли координаты, пропускаем этот адрес
+            continue
         
         # Пауза для геокодера
         await asyncio.sleep(1.1)
@@ -329,9 +450,11 @@ async def process_logistics(message: types.Message):
         return
 
     df = pd.DataFrame(data)
+    
+    # Используем балансированную кластеризацию
     n_cl = min(num_drivers, len(df))
-    kmeans = KMeans(n_clusters=n_cl, n_init=10).fit(df[['lat', 'lon']])
-    df['driver'] = kmeans.labels_
+    labels = balanced_kmeans_clustering(df, n_cl)
+    df['driver'] = labels
 
     # Обновляем сообщение о прогрессе
     await progress_msg.edit_text("✅ *Маршруты построены!*\n📋 *Распределение по водителям:*", parse_mode="Markdown")
@@ -339,16 +462,31 @@ async def process_logistics(message: types.Message):
     # Отправляем маршруты
     for i in range(n_cl):
         driver_points = df[df['driver'] == i]
-        res = f"🚛 *МАРШРУТ №{i+1}*\n"
-        for _, row in driver_points.iterrows():
-            final_view = row['address'].replace("Москва, ", "")
-            res += f"📍 {final_view}\n"
+        
+        if len(driver_points) == 0:
+            continue
+            
+        # Строим оптимальный маршрут для этого водителя
+        points_coords = list(zip(driver_points['lat'], driver_points['lon']))
+        route_order = build_optimal_route(points_coords)
+        
+        res = f"🚛 *МАРШРУТ №{i+1}* ({len(driver_points)} адрес(ов))\n\n"
+        
+        # Формируем адреса в правильном порядке
+        ordered_addresses = driver_points.iloc[route_order]['address'].tolist()
+        
+        for j, address in enumerate(ordered_addresses, 1):
+            # Убираем "Москва, " для более компактного отображения
+            final_view = address.replace("Москва, ", "")
+            res += f"{j}. {final_view}\n"
+        
         await message.answer(res, parse_mode="Markdown")
     
     # Показываем статистику
     stats = f"📊 *Статистика распределения:*\n"
-    stats += f"• Всего адресов: {len(raw_addresses)}\n"
-    stats += f"• Количество водителей: {n_cl}\n"
+    stats += f"• Всего обработано адресов: {len(data)}\n"
+    stats += f"• Распределено на водителей: {n_cl}\n\n"
+    
     for i in range(n_cl):
         driver_count = len(df[df['driver'] == i])
         stats += f"• Водитель {i+1}: {driver_count} адрес(ов)\n"
