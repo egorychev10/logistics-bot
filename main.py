@@ -1,22 +1,40 @@
 import os
 import re
 import asyncio
+import json
 import pdfplumber
 import pandas as pd
 import numpy as np
 import uuid
+from datetime import datetime
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
-from geopy.geocoders import Nominatim
-from sklearn.cluster import KMeans
-from sklearn.metrics import pairwise_distances
+from aiogram.types import (
+    ReplyKeyboardMarkup, KeyboardButton, 
+    InlineKeyboardMarkup, InlineKeyboardButton,
+    CallbackQuery
+)
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+import aiohttp
 from aiohttp import web
+import asyncio
+from sklearn.cluster import KMeans
+from collections import defaultdict
 
+# --- Конфигурация ---
 TOKEN = os.getenv("BOT_TOKEN")
+TOMTOM_API_KEY = os.getenv("TOMTOM_API_KEY")
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 user_data = {}
+
+# --- Состояния для FSM ---
+class RouteStates(StatesGroup):
+    waiting_for_departure_time = State()
+    waiting_for_return_settings = State()
+    editing_routes = State()
+    moving_address = State()
 
 # --- Сервер для Render ---
 async def handle_health(request):
@@ -193,116 +211,292 @@ def clean_address(text):
     
     return res.strip(' ,.')
 
-# --- Логика Геокодинга и Маршрутов ---
-def get_coords(address):
+# --- TomTom API функции ---
+async def geocode_with_tomtom(address: str):
+    """Геокодирование адреса через TomTom API"""
+    if not TOMTOM_API_KEY:
+        return None
+    
+    url = f"https://api.tomtom.com/search/2/geocode/{address}.json"
+    params = {
+        "key": TOMTOM_API_KEY,
+        "limit": 1,
+        "countrySet": "RU",
+        "language": "ru-RU"
+    }
+    
     try:
-        geolocator = Nominatim(user_agent="logistic_v17_stable")
-        location = geolocator.geocode(address, timeout=10)
-        return (location.latitude, location.longitude) if location else None
-    except: return None
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, params=params, timeout=10) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    if data.get('results') and len(data['results']) > 0:
+                        result = data['results'][0]
+                        return {
+                            'lat': result['position']['lat'],
+                            'lon': result['position']['lon'],
+                            'address': result['address']['freeformAddress']
+                        }
+    except Exception as e:
+        print(f"TomTom geocoding error: {e}")
+    
+    return None
 
-def balanced_kmeans_clustering(coords, n_clusters, max_iter=100):
-    """
-    Выполняет сбалансированную кластеризацию K-Means
-    Алгоритм итеративно перераспределяет точки для достижения баланса
-    """
+async def calculate_route_matrix(origins: list, destinations: list, departure_time: str = None):
+    """Расчет матрицы времени/расстояний между точками"""
+    if not TOMTOM_API_KEY:
+        return None
+    
+    # Формируем точки в формате TomTom
+    origins_str = [f"{o['lon']},{o['lat']}" for o in origins]
+    destinations_str = [f"{d['lon']},{d['lat']}" for d in destinations]
+    
+    url = "https://api.tomtom.com/routing/matrix/2"
+    params = {
+        "key": TOMTOM_API_KEY,
+        "travelMode": "car",
+        "traffic": "true",
+        "routeType": "fastest"
+    }
+    
+    if departure_time:
+        params["departAt"] = departure_time
+    
+    payload = {
+        "origins": [{"point": {"latitude": o['lat'], "longitude": o['lon']}} for o in origins],
+        "destinations": [{"point": {"latitude": d['lat'], "longitude": d['lon']}} for d in destinations],
+        "options": {
+            "traffic": True,
+            "travelMode": "car",
+            "routeType": "fastest"
+        }
+    }
+    
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                url, 
+                params=params, 
+                json=payload,
+                timeout=30
+            ) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    return data
+    except Exception as e:
+        print(f"TomTom matrix error: {e}")
+    
+    return None
+
+async def calculate_route(waypoints: list, departure_time: str = None, return_to_start: bool = False):
+    """Расчет оптимального маршрута через TomTom"""
+    if not TOMTOM_API_KEY:
+        return None
+    
+    # Формируем строку точек
+    points_str = ";".join([f"{wp['lon']},{wp['lat']}" for wp in waypoints])
+    
+    url = f"https://api.tomtom.com/routing/1/calculateRoute/{points_str}/json"
+    params = {
+        "key": TOMTOM_API_KEY,
+        "travelMode": "car",
+        "traffic": "true",
+        "routeType": "fastest",
+        "computeBestOrder": True,  # Оптимизация порядка посещения
+        "instructionsType": "text",
+        "language": "ru-RU"
+    }
+    
+    if departure_time:
+        params["departAt"] = departure_time
+    
+    # Если нужно вернуться в начало, добавляем первую точку в конец
+    if return_to_start and len(waypoints) > 1:
+        points_str = f"{points_str};{waypoints[0]['lon']},{waypoints[0]['lat']}"
+        url = f"https://api.tomtom.com/routing/1/calculateRoute/{points_str}/json"
+    
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, params=params, timeout=30) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    return data
+    except Exception as e:
+        print(f"TomTom routing error: {e}")
+    
+    return None
+
+# --- Алгоритмы кластеризации ---
+def balanced_clustering_by_distance(coords, n_clusters, distance_matrix=None):
+    """Сбалансированная кластеризация с учетом матрицы расстояний"""
     n_points = len(coords)
     
-    # Если точек меньше или равно количеству кластеров
     if n_points <= n_clusters:
         labels = list(range(n_points))
-        while len(labels) < n_points:
-            labels.append(0)
         return labels
     
-    # Инициализация обычным KMeans
-    kmeans = KMeans(n_clusters=n_clusters, n_init=10, random_state=42)
-    labels = kmeans.fit_predict(coords)
-    
-    # Вычисляем текущее распределение
-    cluster_sizes = np.bincount(labels, minlength=n_clusters)
-    target_size = n_points // n_clusters
-    max_per_cluster = target_size + (1 if n_points % n_clusters > 0 else 0)
-    
-    # Итеративное балансирование
-    for iteration in range(max_iter):
-        # Проверяем баланс
-        if np.max(cluster_sizes) <= max_per_cluster and np.min(cluster_sizes) >= target_size:
-            break
+    # Если нет матрицы расстояний, используем географические координаты
+    if distance_matrix is None:
+        kmeans = KMeans(n_clusters=n_clusters, n_init=10, random_state=42)
+        labels = kmeans.fit_predict(coords)
+    else:
+        # Используем матрицу расстояний для инициализации центроидов
+        # Выбираем самые удаленные точки как начальные центры
+        from scipy.spatial.distance import pdist, squareform
+        distances = squareform(pdist(coords))
         
+        # Первый центр - случайная точка
+        centers = [np.random.randint(n_points)]
+        
+        # Последующие центры - наиболее удаленные от уже выбранных
+        for _ in range(1, n_clusters):
+            dist_to_centers = distances[:, centers].min(axis=1)
+            new_center = np.argmax(dist_to_centers)
+            centers.append(new_center)
+        
+        # Присваиваем точки ближайшему центру
+        labels = np.argmin(distances[:, centers], axis=1)
+    
+    # Балансировка
+    labels = balance_clusters(labels, n_clusters)
+    
+    return labels
+
+def balance_clusters(labels, n_clusters):
+    """Балансировка кластеров по количеству точек"""
+    n_points = len(labels)
+    target_size = n_points // n_clusters
+    max_size = target_size + (1 if n_points % n_clusters != 0 else 0)
+    
+    cluster_sizes = np.bincount(labels, minlength=n_clusters)
+    
+    for _ in range(100):  # Максимум 100 итераций
         # Находим переполненный и недозаполненный кластеры
         overloaded = np.argmax(cluster_sizes)
         underloaded = np.argmin(cluster_sizes)
         
-        if cluster_sizes[overloaded] <= cluster_sizes[underloaded] + 1:
+        if cluster_sizes[overloaded] <= max_size and cluster_sizes[underloaded] >= target_size:
             break
         
-        # Находим точки в переполненном кластере
+        # Находим точку в переполненном кластере, ближайшую к центру недозаполненного
         overloaded_points = np.where(labels == overloaded)[0]
+        underloaded_points = np.where(labels == underloaded)[0]
         
-        # Вычисляем расстояния от этих точек до центров недозаполненного кластера
-        overloaded_coords = coords[overloaded_points]
-        underloaded_center = kmeans.cluster_centers_[underloaded]
-        
-        distances = np.linalg.norm(overloaded_coords - underloaded_center, axis=1)
-        
-        # Выбираем точку с минимальным расстоянием для перемещения
-        idx_to_move = np.argmin(distances)
-        point_idx = overloaded_points[idx_to_move]
+        if len(underloaded_points) == 0:
+            # Если в недозаполненном кластере нет точек, просто перемещаем случайную
+            point_to_move = np.random.choice(overloaded_points)
+        else:
+            # Вычисляем средние координаты недозаполненного кластера
+            underloaded_center = np.mean(underloaded_points)
+            
+            # Находим ближайшую точку
+            distances = np.abs(overloaded_points - underloaded_center)
+            point_to_move = overloaded_points[np.argmin(distances)]
         
         # Перемещаем точку
-        labels[point_idx] = underloaded
-        
-        # Обновляем размеры кластеров
+        labels[point_to_move] = underloaded
         cluster_sizes[overloaded] -= 1
         cluster_sizes[underloaded] += 1
     
     return labels
 
-def hierarchical_balanced_clustering(coords, n_clusters):
-    """
-    Иерархическая кластеризация с балансировкой по количеству точек
-    """
-    from scipy.cluster.hierarchy import linkage, fcluster
-    from scipy.spatial.distance import pdist
-    
-    n_points = len(coords)
-    
-    if n_points <= n_clusters:
-        labels = list(range(n_points))
-        while len(labels) < n_points:
-            labels.append(0)
-        return labels
-    
-    # Вычисляем матрицу расстояний
-    distances = pdist(coords)
-    
-    # Иерархическая кластеризация
-    Z = linkage(distances, method='ward')
-    
-    # Находим высоту разреза, которая дает примерно n_clusters кластеров
-    # Но нам нужно точно n_clusters
-    labels = fcluster(Z, n_clusters, criterion='maxclust') - 1
-    
-    # Проверяем баланс
-    cluster_sizes = np.bincount(labels, minlength=n_clusters)
-    
-    # Если дисбаланс слишком большой, используем алгоритм балансировки
-    max_size = np.max(cluster_sizes)
-    min_size = np.min(cluster_sizes)
-    
-    if max_size - min_size > 3:  # Допустимая разница
-        return balanced_kmeans_clustering(coords, n_clusters)
-    
-    return labels
-
+# --- Обработчики команд ---
 @dp.message(Command("start"))
 async def start(message: types.Message):
-    user_data[message.from_user.id] = {'addresses': []}
-    await message.answer("Бот V17 готов. Загрузка файлов оптимизирована (без ошибок флуда).")
+    user_id = message.from_user.id
+    user_data[user_id] = {
+        'addresses': [],
+        'origin_address': None,
+        'origin_coords': None,
+        'routes': None,
+        'departure_time': None,
+        'return_settings': {}
+    }
+    
+    # Кнопка для установки адреса производства
+    kb = [[KeyboardButton(text="🏭 Установить адрес производства")]]
+    markup = ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
+    
+    await message.answer(
+        "🚚 *Бот логистической компании*\n\n"
+        "Отправьте мне PDF-файлы с накладными для извлечения адресов.\n"
+        "После загрузки всех файлов нажмите кнопку для распределения маршрутов.\n\n"
+        "Сначала установите адрес производства:",
+        reply_markup=markup,
+        parse_mode="Markdown"
+    )
+
+@dp.message(F.text == "🏭 Установить адрес производства")
+async def set_origin_address(message: types.Message):
+    await message.answer(
+        "📍 Отправьте адрес производства (например: Москва, ул. Ленина, 1):\n"
+        "Или отправьте геолокацию с телефона."
+    )
+
+@dp.message(F.text & ~F.text.startswith('/'))
+async def handle_text_address(message: types.Message):
+    user_id = message.from_user.id
+    text = message.text.strip()
+    
+    # Проверяем, похоже ли это на адрес
+    if any(keyword in text.lower() for keyword in ['москва', 'ул.', 'проспект', 'улица', 'дом', 'д.']):
+        # Сохраняем адрес производства
+        user_data[user_id]['origin_address'] = text
+        
+        # Геокодируем через TomTom
+        progress = await message.answer("📍 Определяю координаты...")
+        
+        geocode_result = await geocode_with_tomtom(text)
+        if geocode_result:
+            user_data[user_id]['origin_coords'] = {
+                'lat': geocode_result['lat'],
+                'lon': geocode_result['lon'],
+                'address': geocode_result['address']
+            }
+            await progress.delete()
+            await message.answer(
+                f"✅ Адрес производства установлен:\n"
+                f"`{geocode_result['address']}`\n\n"
+                f"Координаты: {geocode_result['lat']:.6f}, {geocode_result['lon']:.6f}",
+                parse_mode="Markdown"
+            )
+        else:
+            await progress.edit_text("❌ Не удалось определить координаты. Проверьте адрес.")
+    else:
+        await message.answer("Отправьте мне PDF-файлы с накладными или установите адрес производства.")
+
+@dp.message(F.location)
+async def handle_location(message: types.Message):
+    user_id = message.from_user.id
+    location = message.location
+    
+    user_data[user_id]['origin_coords'] = {
+        'lat': location.latitude,
+        'lon': location.longitude,
+        'address': f"Геолокация: {location.latitude:.6f}, {location.longitude:.6f}"
+    }
+    
+    await message.answer(
+        f"📍 Адрес производства установлен по геолокации:\n"
+        f"Координаты: {location.latitude:.6f}, {location.longitude:.6f}",
+        parse_mode="Markdown"
+    )
 
 @dp.message(F.document)
 async def handle_docs(message: types.Message):
+    user_id = message.from_user.id
+    
+    # Инициализация данных пользователя, если нужно
+    if user_id not in user_data:
+        user_data[user_id] = {
+            'addresses': [],
+            'origin_address': None,
+            'origin_coords': None,
+            'routes': None,
+            'departure_time': None,
+            'return_settings': {}
+        }
+    
     if not message.document.file_name.lower().endswith('.pdf'): 
         return
     
@@ -322,25 +516,36 @@ async def handle_docs(message: types.Message):
             await processing_msg.delete()
 
             if addr:
-                if message.from_user.id not in user_data: 
-                    user_data[message.from_user.id] = {'addresses': []}
-                user_data[message.from_user.id]['addresses'].append(addr)
+                if 'addresses' not in user_data[user_id]:
+                    user_data[user_id]['addresses'] = []
                 
-                # Считаем количество адресов
-                total_addresses = len(user_data[message.from_user.id]['addresses'])
+                # Геокодируем адрес через TomTom
+                geocode_msg = await message.answer("📍 Определяю координаты адреса...")
+                geocode_result = await geocode_with_tomtom(addr)
                 
-                await message.answer(
-                    f"✅ **Адрес добавлен:**\n`{addr}`\n\n"
-                    f"📊 Всего адресов: {total_addresses}",
-                    parse_mode="Markdown"
-                )
-                
-                # Автоматически запрашиваем количество водителей
-                await ask_drivers_auto(message)
+                if geocode_result:
+                    address_data = {
+                        'original': addr,
+                        'cleaned': geocode_result['address'],
+                        'lat': geocode_result['lat'],
+                        'lon': geocode_result['lon'],
+                        'id': str(uuid.uuid4())[:8]  # Уникальный ID для адреса
+                    }
+                    user_data[user_id]['addresses'].append(address_data)
+                    
+                    await geocode_msg.delete()
+                    await message.answer(
+                        f"✅ *Адрес добавлен:*\n"
+                        f"`{geocode_result['address']}`\n\n"
+                        f"📍 Координаты: {geocode_result['lat']:.6f}, {geocode_result['lon']:.6f}\n"
+                        f"📊 Всего адресов: {len(user_data[user_id]['addresses'])}",
+                        parse_mode="Markdown"
+                    )
+                else:
+                    await geocode_msg.edit_text(f"❌ Не удалось определить координаты для адреса:\n`{addr}`")
             else:
                 await message.answer(f"❌ Ошибка распознавания в {message.document.file_name}")
     except Exception as e:
-        # Удаляем сообщение об обработке даже в случае ошибки
         try:
             await processing_msg.delete()
         except:
@@ -349,149 +554,707 @@ async def handle_docs(message: types.Message):
     finally:
         if os.path.exists(temp_fn): 
             os.remove(temp_fn)
+        
+        # После обработки файла показываем кнопку для распределения маршрутов
+        if user_data[user_id]['addresses']:
+            kb = [[KeyboardButton(text="🚚 Распределить маршруты")]]
+            markup = ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
+            await message.answer(
+                f"📊 Загружено адресов: {len(user_data[user_id]['addresses'])}\n"
+                f"Нажмите кнопку для распределения маршрутов:",
+                reply_markup=markup
+            )
 
-async def ask_drivers_auto(message: types.Message):
-    """Автоматический запрос количества водителей"""
-    u_id = message.from_user.id
+@dp.message(F.text == "🚚 Распределить маршруты")
+async def start_route_distribution(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
     
-    if u_id not in user_data or not user_data[u_id]['addresses']:
+    if user_id not in user_data or not user_data[user_id]['addresses']:
+        await message.answer("❌ Сначала загрузите PDF-файлы с адресами!")
         return
     
-    # Даем небольшую паузу перед запросом
-    await asyncio.sleep(0.5)
+    if not user_data[user_id]['origin_coords']:
+        await message.answer("❌ Сначала установите адрес производства!")
+        return
     
-    total_addresses = len(user_data[u_id]['addresses'])
+    # Запрашиваем количество водителей
     kb = [[KeyboardButton(text=str(i)) for i in range(1, 4)], 
           [KeyboardButton(text=str(i)) for i in range(4, 7)]]
     markup = ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
     
     await message.answer(
-        f"📦 *Обработка завершена!*\n"
-        f"📊 Всего адресов: {total_addresses}\n\n"
-        f"🚚 *На скольких водителей распределить адреса?*",
-        reply_markup=markup,
-        parse_mode="Markdown"
-    )
-
-@dp.message(F.text == "🚚 Начать обработку накладных")
-async def ask_drivers_manual(message: types.Message):
-    """Ручной запрос количества водителей (по кнопке)"""
-    u_id = message.from_user.id
-    if u_id not in user_data or not user_data[u_id]['addresses']:
-        await message.answer("❌ Сначала пришлите PDF-файлы с накладными!")
-        return
-    
-    total_addresses = len(user_data[u_id]['addresses'])
-    kb = [[KeyboardButton(text=str(i)) for i in range(1, 4)], 
-          [KeyboardButton(text=str(i)) for i in range(4, 7)]]
-    markup = ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
-    
-    await message.answer(
-        f"📊 Всего адресов: {total_addresses}\n"
+        f"📊 Всего адресов: {len(user_data[user_id]['addresses'])}\n"
         f"🚚 *На скольких водителей распределить адреса?*",
         reply_markup=markup,
         parse_mode="Markdown"
     )
 
 @dp.message(F.text.regexp(r'^\d+$'))
-async def process_logistics(message: types.Message):
+async def process_num_drivers(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
     num_drivers = int(message.text)
+    
+    # Сохраняем количество водителей
+    user_data[user_id]['num_drivers'] = num_drivers
+    
+    # Запрашиваем время отправления
+    await state.set_state(RouteStates.waiting_for_departure_time)
+    
+    kb = [[
+        KeyboardButton(text="Сейчас"),
+        KeyboardButton(text="08:00"),
+        KeyboardButton(text="09:00")
+    ], [
+        KeyboardButton(text="10:00"),
+        KeyboardButton(text="Указать свое время")
+    ]]
+    markup = ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
+    
+    await message.answer(
+        "⏰ *Укажите время отправления водителей:*\n\n"
+        "Формат: ЧЧ:MM (например, 08:30)\n"
+        "Или выберите из предложенных вариантов.",
+        reply_markup=markup,
+        parse_mode="Markdown"
+    )
+
+@dp.message(RouteStates.waiting_for_departure_time)
+async def process_departure_time(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    time_text = message.text.strip()
+    
+    if time_text == "Указать свое время":
+        await message.answer("Введите время в формате ЧЧ:MM (например, 08:30):")
+        return
+    
+    # Парсим время
+    if time_text == "Сейчас":
+        departure_time = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+        display_time = "текущее время"
+    else:
+        try:
+            # Проверяем формат времени
+            if ":" in time_text:
+                hours, minutes = map(int, time_text.split(":"))
+                if 0 <= hours < 24 and 0 <= minutes < 60:
+                    # Используем сегодняшнюю дату
+                    today = datetime.now().date()
+                    departure_datetime = datetime(
+                        today.year, today.month, today.day, 
+                        hours, minutes
+                    )
+                    departure_time = departure_datetime.strftime("%Y-%m-%dT%H:%M:%S")
+                    display_time = f"{hours:02d}:{minutes:02d}"
+                else:
+                    raise ValueError("Неверное время")
+            else:
+                raise ValueError("Неверный формат")
+        except:
+            await message.answer("❌ Неверный формат времени. Используйте ЧЧ:MM (например, 08:30)")
+            return
+    
+    user_data[user_id]['departure_time'] = departure_time
+    user_data[user_id]['display_time'] = display_time
+    
+    # Запрашиваем настройки возврата
+    await state.set_state(RouteStates.waiting_for_return_settings)
+    
+    kb = [[
+        KeyboardButton(text="Все возвращаются"),
+        KeyboardButton(text="Никто не возвращается")
+    ], [
+        KeyboardButton(text="Указать индивидуально")
+    ]]
+    markup = ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
+    
+    await message.answer(
+        "🔄 *Настройки возврата на производство:*\n\n"
+        "Выберите, какие водители должны вернуться на производство после завершения маршрута.",
+        reply_markup=markup,
+        parse_mode="Markdown"
+    )
+
+@dp.message(RouteStates.waiting_for_return_settings)
+async def process_return_settings(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    setting = message.text.strip()
+    
+    if setting == "Все возвращаются":
+        num_drivers = user_data[user_id]['num_drivers']
+        user_data[user_id]['return_settings'] = {i: True for i in range(num_drivers)}
+        await calculate_and_show_routes(message, state)
+    elif setting == "Никто не возвращается":
+        num_drivers = user_data[user_id]['num_drivers']
+        user_data[user_id]['return_settings'] = {i: False for i in range(num_drivers)}
+        await calculate_and_show_routes(message, state)
+    elif setting == "Указать индивидуально":
+        num_drivers = user_data[user_id]['num_drivers']
+        
+        # Создаем инлайн-клавиатуру для выбора водителей
+        keyboard = []
+        for i in range(num_drivers):
+            keyboard.append([
+                InlineKeyboardButton(
+                    text=f"Водитель {i+1} ❌", 
+                    callback_data=f"toggle_return_{i}_false"
+                )
+            ])
+        
+        keyboard.append([
+            InlineKeyboardButton(
+                text="✅ Продолжить", 
+                callback_data="finish_return_settings"
+            )
+        ])
+        
+        markup = InlineKeyboardMarkup(inline_keyboard=keyboard)
+        
+        await message.answer(
+            "👥 *Настройка возврата для каждого водителя:*\n\n"
+            "Нажмите на кнопку водителя, чтобы изменить настройку возврата.\n"
+            "❌ - не возвращается\n"
+            "✅ - возвращается\n\n"
+            "После настройки нажмите 'Продолжить'.",
+            reply_markup=markup,
+            parse_mode="Markdown"
+        )
+
+@dp.callback_query(F.data.startswith("toggle_return_"))
+async def toggle_return_setting(callback: CallbackQuery, state: FSMContext):
+    user_id = callback.from_user.id
+    data = callback.data
+    
+    # Парсим данные
+    parts = data.split("_")
+    driver_idx = int(parts[2])
+    current_setting = parts[3]
+    
+    # Меняем настройку
+    new_setting = "true" if current_setting == "false" else "false"
+    
+    # Обновляем данные
+    if 'return_settings' not in user_data[user_id]:
+        user_data[user_id]['return_settings'] = {}
+    
+    user_data[user_id]['return_settings'][driver_idx] = (new_setting == "true")
+    
+    # Обновляем кнопку
+    button_text = f"Водитель {driver_idx+1} ✅" if new_setting == "true" else f"Водитель {driver_idx+1} ❌"
+    
+    await callback.message.edit_reply_markup(
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text=f"Водитель {i+1} {'✅' if user_data[user_id]['return_settings'].get(i, False) else '❌'}",
+                        callback_data=f"toggle_return_{i}_{str(user_data[user_id]['return_settings'].get(i, False)).lower()}"
+                    )
+                ] for i in range(user_data[user_id]['num_drivers'])
+            ] + [[
+                InlineKeyboardButton(
+                    text="✅ Продолжить", 
+                    callback_data="finish_return_settings"
+                )
+            ]]
+        )
+    )
+    
+    await callback.answer()
+
+@dp.callback_query(F.data == "finish_return_settings")
+async def finish_return_settings(callback: CallbackQuery, state: FSMContext):
+    await callback.message.delete()
+    await calculate_and_show_routes(callback.message, state)
+
+async def calculate_and_show_routes(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
     
-    if user_id not in user_data or not user_data[user_id]['addresses']:
-        await message.answer("❌ Нет адресов для обработки!")
+    if user_id not in user_data:
+        await message.answer("❌ Ошибка: данные не найдены")
         return
     
-    raw_addresses = list(set(user_data[user_id]['addresses']))
+    # Показываем прогресс
+    progress_msg = await message.answer("🗺️ *Строю оптимальные маршруты...*\n\n"
+                                       "Это может занять несколько минут.",
+                                       parse_mode="Markdown")
     
-    # Показываем индикатор обработки маршрутов
-    progress_msg = await message.answer("🗺️ *Строю оптимальные маршруты...*", parse_mode="Markdown")
-    
-    # Показываем индикатор поиска местоположения
-    await bot.send_chat_action(message.chat.id, "find_location")
-
-    data = []
-    for addr in raw_addresses:
-        coords = get_coords(addr)
-        if not coords: 
-            coords = get_coords(", ".join(addr.split(',')[:2]))
-        if coords: 
-            data.append({'address': addr, 'lat': coords[0], 'lon': coords[1]})
+    try:
+        # Подготавливаем данные
+        addresses = user_data[user_id]['addresses']
+        origin = user_data[user_id]['origin_coords']
+        num_drivers = user_data[user_id]['num_drivers']
+        departure_time = user_data[user_id]['departure_time']
+        return_settings = user_data[user_id]['return_settings']
         
-        # Пауза для геокодера
-        await asyncio.sleep(1.1)
-
-    if not data:
-        await progress_msg.edit_text("❌ Ошибка поиска координат на карте.")
-        return
-
-    df = pd.DataFrame(data)
-    n_cl = min(num_drivers, len(df))
-    
-    # Используем сбалансированную кластеризацию
-    coords_array = np.array(df[['lat', 'lon']].values)
-    
-    if n_cl > 1:
-        # Пробуем несколько раз найти сбалансированное решение
-        best_labels = None
-        best_balance = float('inf')
+        # Преобразуем координаты в массив
+        coords = np.array([[addr['lat'], addr['lon']] for addr in addresses])
         
-        for attempt in range(5):  # 5 попыток с разными методами
-            if attempt % 2 == 0:
-                labels = balanced_kmeans_clustering(coords_array, n_cl)
+        # Кластеризуем адреса
+        if len(addresses) <= num_drivers:
+            # Если адресов меньше или равно количеству водителей
+            labels = list(range(len(addresses)))
+        else:
+            # Используем сбалансированную кластеризацию
+            labels = balanced_clustering_by_distance(coords, num_drivers)
+        
+        # Создаем маршруты для каждого водителя
+        routes = []
+        total_driving_time = 0
+        total_distance = 0
+        
+        for driver_idx in range(num_drivers):
+            # Адреса для этого водителя
+            driver_addresses = [addr for i, addr in enumerate(addresses) if labels[i] == driver_idx]
+            
+            if not driver_addresses:
+                # Если у водителя нет адресов
+                routes.append({
+                    'driver_id': driver_idx,
+                    'addresses': [],
+                    'waypoints': [],
+                    'optimized_route': None,
+                    'total_time': 0,
+                    'total_distance': 0,
+                    'return_to_origin': return_settings.get(driver_idx, True)
+                })
+                continue
+            
+            # Формируем waypoints: начало (производство) + адреса водителя
+            waypoints = [origin] + driver_addresses
+            
+            # Рассчитываем маршрут через TomTom
+            route_data = await calculate_route(
+                waypoints=waypoints,
+                departure_time=departure_time,
+                return_to_start=return_settings.get(driver_idx, True)
+            )
+            
+            if route_data and 'routes' in route_data and route_data['routes']:
+                route_summary = route_data['routes'][0]['summary']
+                
+                routes.append({
+                    'driver_id': driver_idx,
+                    'addresses': driver_addresses,
+                    'waypoints': waypoints,
+                    'optimized_route': route_data,
+                    'total_time': route_summary.get('travelTimeInSeconds', 0),
+                    'total_distance': route_summary.get('lengthInMeters', 0),
+                    'return_to_origin': return_settings.get(driver_idx, True)
+                })
+                
+                total_driving_time += route_summary.get('travelTimeInSeconds', 0)
+                total_distance += route_summary.get('lengthInMeters', 0)
             else:
-                labels = hierarchical_balanced_clustering(coords_array, n_cl)
-            
-            # Оцениваем баланс
-            cluster_sizes = np.bincount(labels, minlength=n_cl)
-            balance_score = np.std(cluster_sizes)  # Меньше = лучше
-            
-            if balance_score < best_balance:
-                best_balance = balance_score
-                best_labels = labels
+                # Если TomTom API не сработал, создаем простой маршрут
+                routes.append({
+                    'driver_id': driver_idx,
+                    'addresses': driver_addresses,
+                    'waypoints': waypoints,
+                    'optimized_route': None,
+                    'total_time': 0,
+                    'total_distance': 0,
+                    'return_to_origin': return_settings.get(driver_idx, True)
+                })
         
-        df['driver'] = best_labels
+        # Сохраняем маршруты
+        user_data[user_id]['routes'] = routes
+        user_data[user_id]['clustering_labels'] = labels
+        
+        # Обновляем сообщение о прогрессе
+        await progress_msg.edit_text("✅ *Маршруты построены!*\n\n"
+                                    f"⏰ Время отправления: {user_data[user_id]['display_time']}\n"
+                                    f"🚚 Количество водителей: {num_drivers}\n"
+                                    f"📊 Всего адресов: {len(addresses)}",
+                                    parse_mode="Markdown")
+        
+        # Показываем маршруты
+        await show_routes(message, routes, total_driving_time, total_distance)
+        
+        # Показываем кнопки для редактирования
+        await show_edit_buttons(message)
+        
+    except Exception as e:
+        await progress_msg.edit_text(f"❌ Ошибка при построении маршрутов: {str(e)}")
+        print(f"Route calculation error: {e}")
+    
+    await state.clear()
+
+async def show_routes(message: types.Message, routes, total_time, total_distance):
+    """Отображение маршрутов"""
+    for route in routes:
+        driver_idx = route['driver_id'] + 1
+        address_count = len(route['addresses'])
+        return_text = "🔄 Возвращается на производство" if route['return_to_origin'] else "⏹️ Не возвращается"
+        
+        # Форматируем время и расстояние
+        hours = route['total_time'] // 3600
+        minutes = (route['total_time'] % 3600) // 60
+        distance_km = route['total_distance'] / 1000
+        
+        route_text = (
+            f"🚛 *МАРШРУТ №{driver_idx}*\n"
+            f"📊 Адресов: {address_count}\n"
+            f"⏱️ Время: {hours} ч {minutes} мин\n"
+            f"📏 Расстояние: {distance_km:.1f} км\n"
+            f"{return_text}\n\n"
+        )
+        
+        # Добавляем адреса
+        for i, addr in enumerate(route['addresses'], 1):
+            route_text += f"{i}. {addr['cleaned']}\n"
+        
+        await message.answer(route_text, parse_mode="Markdown")
+    
+    # Общая статистика
+    total_hours = total_time // 3600
+    total_minutes = (total_time % 3600) // 60
+    total_distance_km = total_distance / 1000
+    
+    stats_text = (
+        f"📊 *ОБЩАЯ СТАТИСТИКА*\n"
+        f"⏱️ Общее время: {total_hours} ч {total_minutes} мин\n"
+        f"📏 Общее расстояние: {total_distance_km:.1f} км\n"
+        f"🚚 Количество водителей: {len(routes)}\n"
+        f"📍 Всего адресов: {sum(len(r['addresses']) for r in routes)}"
+    )
+    
+    await message.answer(stats_text, parse_mode="Markdown")
+
+async def show_edit_buttons(message: types.Message):
+    """Показ кнопок для редактирования маршрутов"""
+    keyboard = [
+        [InlineKeyboardButton(text="✏️ Редактировать маршруты", callback_data="edit_routes")],
+        [InlineKeyboardButton(text="🔄 Пересчитать маршруты", callback_data="recalculate_routes")],
+        [InlineKeyboardButton(text="💾 Экспорт маршрутов", callback_data="export_routes")]
+    ]
+    
+    markup = InlineKeyboardMarkup(inline_keyboard=keyboard)
+    
+    await message.answer(
+        "🛠️ *Управление маршрутами:*\n\n"
+        "Вы можете отредактировать маршруты, перемещая адреса между водителями, "
+        "или пересчитать маршруты с другими параметрами.",
+        reply_markup=markup,
+        parse_mode="Markdown"
+    )
+
+@dp.callback_query(F.data == "edit_routes")
+async def start_editing_routes(callback: CallbackQuery, state: FSMContext):
+    user_id = callback.from_user.id
+    
+    if user_id not in user_data or 'routes' not in user_data[user_id]:
+        await callback.answer("❌ Маршруты не найдены")
+        return
+    
+    routes = user_data[user_id]['routes']
+    
+    # Создаем меню выбора маршрута для редактирования
+    keyboard = []
+    for route in routes:
+        driver_idx = route['driver_id'] + 1
+        address_count = len(route['addresses'])
+        keyboard.append([
+            InlineKeyboardButton(
+                text=f"🚛 Маршрут {driver_idx} ({address_count} адресов)",
+                callback_data=f"edit_route_{route['driver_id']}"
+            )
+        ])
+    
+    keyboard.append([InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_main")])
+    
+    markup = InlineKeyboardMarkup(inline_keyboard=keyboard)
+    
+    await callback.message.edit_text(
+        "✏️ *Редактирование маршрутов*\n\n"
+        "Выберите маршрут для редактирования:",
+        reply_markup=markup,
+        parse_mode="Markdown"
+    )
+
+@dp.callback_query(F.data.startswith("edit_route_"))
+async def edit_specific_route(callback: CallbackQuery, state: FSMContext):
+    user_id = callback.from_user.id
+    route_idx = int(callback.data.split("_")[2])
+    
+    if user_id not in user_data or 'routes' not in user_data[user_id]:
+        await callback.answer("❌ Маршруты не найдены")
+        return
+    
+    routes = user_data[user_id]['routes']
+    
+    if route_idx >= len(routes):
+        await callback.answer("❌ Маршрут не найден")
+        return
+    
+    route = routes[route_idx]
+    
+    # Создаем список адресов с кнопками для перемещения
+    keyboard = []
+    
+    if not route['addresses']:
+        keyboard.append([
+            InlineKeyboardButton(
+                text="⚠️ В этом маршруте нет адресов",
+                callback_data="no_action"
+            )
+        ])
     else:
-        df['driver'] = 0
+        for i, addr in enumerate(route['addresses']):
+            keyboard.append([
+                InlineKeyboardButton(
+                    text=f"📍 {addr['cleaned'][:30]}...",
+                    callback_data=f"select_address_{route_idx}_{i}"
+                )
+            ])
+    
+    keyboard.append([InlineKeyboardButton(text="🔙 Назад", callback_data="edit_routes")])
+    
+    markup = InlineKeyboardMarkup(inline_keyboard=keyboard)
+    
+    await callback.message.edit_text(
+        f"🚛 *Редактирование Маршрута №{route_idx + 1}*\n\n"
+        f"Выберите адрес для перемещения в другой маршрут:",
+        reply_markup=markup,
+        parse_mode="Markdown"
+    )
 
-    # Обновляем сообщение о прогрессе
-    await progress_msg.edit_text("✅ *Маршруты построены!*\n📋 *Распределение по водителям:*", parse_mode="Markdown")
+@dp.callback_query(F.data.startswith("select_address_"))
+async def select_address_for_moving(callback: CallbackQuery, state: FSMContext):
+    user_id = callback.from_user.id
+    data = callback.data.split("_")
+    route_idx = int(data[2])
+    address_idx = int(data[3])
+    
+    if user_id not in user_data or 'routes' not in user_data[user_id]:
+        await callback.answer("❌ Маршруты не найдены")
+        return
+    
+    # Сохраняем выбранный адрес для перемещения
+    await state.set_state(RouteStates.moving_address)
+    await state.update_data({
+        'moving_from_route': route_idx,
+        'moving_address_idx': address_idx
+    })
+    
+    routes = user_data[user_id]['routes']
+    
+    # Создаем меню выбора целевого маршрута
+    keyboard = []
+    
+    for i, target_route in enumerate(routes):
+        if i != route_idx:  # Не показываем текущий маршрут
+            driver_idx = i + 1
+            address_count = len(target_route['addresses'])
+            keyboard.append([
+                InlineKeyboardButton(
+                    text=f"➡️ Маршрут {driver_idx} ({address_count} адресов)",
+                    callback_data=f"move_to_route_{i}"
+                )
+            ])
+    
+    keyboard.append([InlineKeyboardButton(text="❌ Отмена", callback_data=f"edit_route_{route_idx}")])
+    
+    markup = InlineKeyboardMarkup(inline_keyboard=keyboard)
+    
+    await callback.message.edit_text(
+        "📤 *Перемещение адреса*\n\n"
+        "Выберите маршрут, в который переместить адрес:",
+        reply_markup=markup,
+        parse_mode="Markdown"
+    )
 
-    # Отправляем маршруты
-    for i in range(n_cl):
-        driver_points = df[df['driver'] == i]
-        res = f"🚛 *МАРШРУТ №{i+1}*\n"
-        for _, row in driver_points.iterrows():
-            final_view = row['address'].replace("Москва, ", "")
-            res += f"📍 {final_view}\n"
-        await message.answer(res, parse_mode="Markdown")
+@dp.callback_query(F.data.startswith("move_to_route_"))
+async def move_address_to_route(callback: CallbackQuery, state: FSMContext):
+    user_id = callback.from_user.id
+    target_route_idx = int(callback.data.split("_")[3])
     
-    # Показываем детальную статистику
-    stats = f"📊 *Статистика распределения:*\n"
-    stats += f"• Всего адресов: {len(raw_addresses)}\n"
-    stats += f"• Количество водителей: {n_cl}\n"
+    state_data = await state.get_data()
+    source_route_idx = state_data['moving_from_route']
+    address_idx = state_data['moving_address_idx']
     
-    # Сортируем водителей по количеству адресов
-    driver_counts = []
-    for i in range(n_cl):
-        driver_count = len(df[df['driver'] == i])
-        driver_counts.append((i, driver_count))
+    if user_id not in user_data or 'routes' not in user_data[user_id]:
+        await callback.answer("❌ Маршруты не найдены")
+        return
     
-    # Сортируем по количеству адресов (по возрастанию)
-    driver_counts.sort(key=lambda x: x[1])
+    routes = user_data[user_id]['routes']
     
-    for i, count in driver_counts:
-        stats += f"• Водитель {i+1}: {count} адрес(ов)\n"
+    # Проверяем индексы
+    if (source_route_idx >= len(routes) or 
+        target_route_idx >= len(routes) or 
+        address_idx >= len(routes[source_route_idx]['addresses'])):
+        await callback.answer("❌ Ошибка при перемещении")
+        return
     
-    stats += f"\n⚖️ *Баланс:* {best_balance:.2f} (чем меньше, тем равномернее)"
+    # Перемещаем адрес
+    address_to_move = routes[source_route_idx]['addresses'].pop(address_idx)
+    routes[target_route_idx]['addresses'].append(address_to_move)
     
-    await message.answer(stats, parse_mode="Markdown")
+    # Обновляем кластерные метки (для статистики)
+    if 'clustering_labels' in user_data[user_id]:
+        # Находим индекс адреса в общем списке
+        all_addresses = user_data[user_id]['addresses']
+        for i, addr in enumerate(all_addresses):
+            if addr['id'] == address_to_move['id']:
+                user_data[user_id]['clustering_labels'][i] = target_route_idx
+                break
     
-    # Очищаем данные пользователя
-    user_data[user_id] = {'addresses': []}
+    # Пересчитываем маршруты
+    await recalculate_single_route(callback, source_route_idx)
+    await recalculate_single_route(callback, target_route_idx)
     
-    # Удаляем сообщение о прогрессе
-    await progress_msg.delete()
+    await callback.answer(f"✅ Адрес перемещен в Маршрут {target_route_idx + 1}")
+    
+    # Возвращаемся к редактированию исходного маршрута
+    await edit_specific_route(callback, state)
+
+async def recalculate_single_route(callback: CallbackQuery, route_idx: int):
+    """Пересчет одного маршрута"""
+    user_id = callback.from_user.id
+    
+    if user_id not in user_data or 'routes' not in user_data[user_id]:
+        return
+    
+    routes = user_data[user_id]['routes']
+    route = routes[route_idx]
+    
+    # Получаем необходимые данные
+    origin = user_data[user_id]['origin_coords']
+    departure_time = user_data[user_id]['departure_time']
+    return_to_origin = route['return_to_origin']
+    
+    if not route['addresses']:
+        # Если адресов нет
+        route['optimized_route'] = None
+        route['total_time'] = 0
+        route['total_distance'] = 0
+        return
+    
+    # Формируем waypoints
+    waypoints = [origin] + route['addresses']
+    
+    # Рассчитываем маршрут через TomTom
+    route_data = await calculate_route(
+        waypoints=waypoints,
+        departure_time=departure_time,
+        return_to_start=return_to_origin
+    )
+    
+    if route_data and 'routes' in route_data and route_data['routes']:
+        route_summary = route_data['routes'][0]['summary']
+        route['optimized_route'] = route_data
+        route['total_time'] = route_summary.get('travelTimeInSeconds', 0)
+        route['total_distance'] = route_summary.get('lengthInMeters', 0)
+    else:
+        route['optimized_route'] = None
+        route['total_time'] = 0
+        route['total_distance'] = 0
+
+@dp.callback_query(F.data == "recalculate_routes")
+async def recalculate_all_routes(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    
+    if user_id not in user_data:
+        await callback.answer("❌ Данные не найдены")
+        return
+    
+    # Показываем прогресс
+    await callback.message.edit_text("🔄 *Пересчитываю маршруты...*", parse_mode="Markdown")
+    
+    try:
+        # Пересчитываем все маршруты
+        routes = user_data[user_id]['routes']
+        origin = user_data[user_id]['origin_coords']
+        departure_time = user_data[user_id]['departure_time']
+        
+        total_time = 0
+        total_distance = 0
+        
+        for route in routes:
+            if not route['addresses']:
+                continue
+            
+            waypoints = [origin] + route['addresses']
+            return_to_origin = route['return_to_origin']
+            
+            route_data = await calculate_route(
+                waypoints=waypoints,
+                departure_time=departure_time,
+                return_to_start=return_to_origin
+            )
+            
+            if route_data and 'routes' in route_data and route_data['routes']:
+                route_summary = route_data['routes'][0]['summary']
+                route['optimized_route'] = route_data
+                route['total_time'] = route_summary.get('travelTimeInSeconds', 0)
+                route['total_distance'] = route_summary.get('lengthInMeters', 0)
+                
+                total_time += route['total_time']
+                total_distance += route['total_distance']
+        
+        # Обновляем сообщение
+        await callback.message.edit_text("✅ *Маршруты пересчитаны!*", parse_mode="Markdown")
+        
+        # Показываем обновленные маршруты
+        await show_routes(callback.message, routes, total_time, total_distance)
+        
+        # Показываем кнопки для редактирования
+        await show_edit_buttons(callback.message)
+        
+    except Exception as e:
+        await callback.message.edit_text(f"❌ Ошибка при пересчете: {str(e)}")
+
+@dp.callback_query(F.data == "export_routes")
+async def export_routes(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    
+    if user_id not in user_data or 'routes' not in user_data[user_id]:
+        await callback.answer("❌ Маршруты не найдены")
+        return
+    
+    routes = user_data[user_id]['routes']
+    
+    # Создаем текстовый файл с маршрутами
+    export_text = "МАРШРУТЫ ДОСТАВКИ\n"
+    export_text += f"Дата: {datetime.now().strftime('%d.%m.%Y %H:%M')}\n"
+    export_text += f"Адрес производства: {user_data[user_id]['origin_coords']['address']}\n"
+    export_text += f"Время отправления: {user_data[user_id]['display_time']}\n"
+    export_text += "=" * 50 + "\n\n"
+    
+    for route in routes:
+        driver_idx = route['driver_id'] + 1
+        hours = route['total_time'] // 3600
+        minutes = (route['total_time'] % 3600) // 60
+        distance_km = route['total_distance'] / 1000
+        return_text = "Возвращается на производство" if route['return_to_origin'] else "Не возвращается"
+        
+        export_text += f"МАРШРУТ №{driver_idx}\n"
+        export_text += f"Адресов: {len(route['addresses'])}\n"
+        export_text += f"Время: {hours} ч {minutes} мин\n"
+        export_text += f"Расстояние: {distance_km:.1f} км\n"
+        export_text += f"{return_text}\n\n"
+        
+        for i, addr in enumerate(route['addresses'], 1):
+            export_text += f"{i}. {addr['cleaned']}\n"
+        
+        export_text += "\n" + "-" * 40 + "\n\n"
+    
+    # Отправляем как файл
+    await callback.message.answer_document(
+        document=types.BufferedInputFile(
+            export_text.encode('utf-8'),
+            filename=f"маршруты_{datetime.now().strftime('%d%m%Y_%H%M')}.txt"
+        ),
+        caption="📁 Экспорт маршрутов"
+    )
+
+@dp.callback_query(F.data == "back_to_main")
+async def back_to_main_menu(callback: CallbackQuery):
+    await callback.message.delete()
+    await show_edit_buttons(callback.message)
+
+@dp.callback_query(F.data == "no_action")
+async def no_action(callback: CallbackQuery):
+    await callback.answer()
 
 async def main():
     await asyncio.gather(start_web_server(), dp.start_polling(bot))
