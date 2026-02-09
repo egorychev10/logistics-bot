@@ -27,7 +27,7 @@ async def start_web_server():
     site = web.TCPSite(runner, "0.0.0.0", int(os.getenv("PORT", 8080)))
     await site.start()
 
-# --- ТВОЯ ЛОГИКА V9 С ИСПРАВЛЕНИЕМ ХВОСТОВ ---
+# --- ЭТАЛОННАЯ ОЧИСТКА V9 + ФИКСЫ МУСОРА ---
 def clean_address(text):
     # 1. Извлечение блока (ТОРГ-12)
     pattern = re.compile(r"Грузополучатель(.*?)(?:Поставщик|Основание|Номер|Транспортная)", re.DOTALL | re.IGNORECASE)
@@ -45,19 +45,19 @@ def clean_address(text):
 
     # 3. ТОТАЛЬНОЕ УДАЛЕНИЕ МУСОРА (Исправлено под твои замечания)
     junk_patterns = [
-        r'вн\.?тер\.?\s*г\.?[^,]*', # Удаляет "вн.тер.г.Ростокино" и подобные
+        r'вн\.?тер\.?\s*г\.?[^,]*', 
         r'муниципальный округ[^,]*', 
         r'\b(филиал|инн|кпп|бик|огрн|окпо|р/с|к/с)\b', 
-        r'\d{10,25}', # Счета
-        r'банк\w*', # Банки
+        r'\b\d{10,25}\b', # Счета (строго по границам слов)
+        r'банк\w*',
         r'по ОКПО',
         r'организация, адрес, телефон, факс, банковские реквизиты'
     ]
     for p in junk_patterns:
         raw = re.sub(p, '', raw, flags=re.IGNORECASE)
 
-    # 4. ПОИСК НАЧАЛА АДРЕСА (Твоя V9)
-    anchor_pattern = re.compile(r'(Москва|ул\.|ул\s|пр-т|проспект|наб|пер\.|бульвар|шоссе|пл\.)', re.CASEINSENSITIVE)
+    # 4. ПОИСК НАЧАЛА АДРЕСА (Исправленный флаг)
+    anchor_pattern = re.compile(r'(Москва|ул\.|ул\s|пр-т|проспект|наб|пер\.|бульвар|шоссе|пл\.)', re.IGNORECASE)
     match_anchor = anchor_pattern.search(raw)
     if match_anchor:
         raw = raw[match_anchor.start():]
@@ -80,13 +80,17 @@ def clean_address(text):
                 seen_moscow = True
             continue
 
-        # Убираем ФИО и мусор в начале части
+        # Убираем ФИО
         p_clean = re.sub(r'^([А-ЯЁ][а-яё]+\s*){2,3}', '', p_clean).strip()
         
-        # Если часть похожа на адрес (есть буквы и цифры), но не является мусором
-        if len(p_clean) > 1 and not re.match(r'^\d+$', p_clean):
-            # Жестко отсекаем всё после номера дома/строения/помещения
-            # Если нашли пом. или комн. — это финишная прямая
+        # Если в части есть название улицы или номер дома
+        if len(p_clean) > 1:
+            # Обрезаем часть, если в ней после номера дома пошел мусор (р/с и т.д.)
+            # Ищем номер дома и берем текст только до него включительно
+            house_match = re.search(r'(\d+[а-яА-ЯёЁ]?)\b', p_clean)
+            if house_match and any(x in p_clean.lower() for x in ['д.', 'к.', 'стр', 'корп']):
+                p_clean = p_clean[:house_match.end()]
+            
             clean_parts.append(p_clean)
 
     # Сборка
@@ -101,15 +105,14 @@ def clean_address(text):
     res = re.sub(r',\s*(?:д\.|дом)\s*', ', ', res, flags=re.IGNORECASE)
     res = re.sub(r'([а-яА-ЯёЁ]{3,})\s+(\d+)', r'\1, \2', res)
 
-    # Финальная чистка
     res = re.sub(r'\s+', ' ', res)
     res = re.sub(r'[,]{2,}', ',', res)
     return res.strip(' ,.')
 
-# --- ГЕОКОДИНГ И БОТ ---
+# --- ГЕОКОДИНГ ---
 def get_coords(address):
     try:
-        geolocator = Nominatim(user_agent="logistic_v15")
+        geolocator = Nominatim(user_agent="logistic_v15_final")
         location = geolocator.geocode(address, timeout=10)
         return (location.latitude, location.longitude) if location else None
     except: return None
@@ -117,13 +120,12 @@ def get_coords(address):
 @dp.message(Command("start"))
 async def start(message: types.Message):
     user_data[message.from_user.id] = {'addresses': []}
-    await message.answer("Бот восстановлен на базе V9. Добавлена очистка р/с и индикация загрузки.")
+    await message.answer("Бот запущен. Исправлена ошибка CASEINSENSITIVE. Жду файлы!")
 
 @dp.message(F.document)
 async def handle_docs(message: types.Message):
     if not message.document.file_name.lower().endswith('.pdf'): return
     
-    # ИНДИКАЦИЯ ОБРАБОТКИ
     await bot.send_chat_action(message.chat.id, "typing")
     status = await message.answer(f"⏳ Обработка {message.document.file_name}...")
     
@@ -141,7 +143,7 @@ async def handle_docs(message: types.Message):
                 user_data[message.from_user.id]['addresses'].append(addr)
                 await message.answer(f"✅ **Адрес:**\n`{addr}`", parse_mode="Markdown")
             else:
-                await message.answer(f"❌ Ошибка распознавания в {message.document.file_name}")
+                await message.answer(f"❌ Ошибка в {message.document.file_name}")
     finally:
         if os.path.exists(temp_fn): os.remove(temp_fn)
 
@@ -170,7 +172,7 @@ async def process_logistics(message: types.Message):
         await asyncio.sleep(1.1)
 
     if not data:
-        await progress.edit_text("❌ Ошибка поиска координат."); return
+        await progress.edit_text("❌ Ошибка поиска."); return
 
     df = pd.DataFrame(data)
     n_cl = min(num_drivers, len(df))
