@@ -46,12 +46,12 @@ def clean_address(text):
 
     # 3. ТОТАЛЬНОЕ УДАЛЕНИЕ МУСОРА
     junk_patterns = [
-        r'вн\.?тер\.?[^,]*', 
+        r'вн\.?тер\.?[^,]*',                    # Удаляет "вн.тер.Ростокино" и всё до запятой
         r'муниципальный округ[^,]*', 
         r'\b(филиал|инн|кпп|бик|огрн|окпо)\b', 
         r'\b(ип|ооо|пао|ао|зао)\b.*?(?=москва|ул|пр|наб|$)', 
-        r'\d{10,25}',
-        r'\b(р/с|к/с|рс|кс)\b.*',
+        r'\d{10,25}',                           # Длинные счета
+        r'\b(р/с|к/с|рс|кс)\b.*',               # Удаляет р/с и всё что после него
         r'банковские реквизиты.*',
         r'тел\..*'
     ]
@@ -64,65 +64,109 @@ def clean_address(text):
     if match_anchor:
         raw = raw[match_anchor.start():]
 
-    # 5. РАЗБИВКА И ФИЛЬТРАЦИЯ
+    # 5. РАЗБИВКА И ФИЛЬТРАЦИЯ ЧАСТЕЙ
     parts = raw.split(',')
     clean_parts = []
     seen_moscow = False
+    street_detected = False  # Флаг для определения, что уже найдена улица
 
     for p in parts:
         p_clean = p.strip()
+        # Удаляем "г."
         p_clean = re.sub(r'\b(г\.|г|город)\b\.?\s*', '', p_clean, flags=re.IGNORECASE)
         
         if not p_clean: continue
         
+        # Если встречаем "москва" - добавляем один раз
         if "москва" in p_clean.lower():
             if not seen_moscow:
                 clean_parts.append("Москва")
                 seen_moscow = True
             continue
         
-        # Фильтрация ФИО (только если это не название улицы типа Маршала Жукова)
-        if not re.search(r'(ул\.|пр-т|пр\s|пер\.|шоссе)', p_clean, re.I):
-            p_clean = re.sub(r'^([А-ЯЁ][а-яё]+\s*){2,3}', '', p_clean).strip()
+        # Убираем ФИО
+        p_clean = re.sub(r'^([А-ЯЁ][а-яё]+\s*){2,3}', '', p_clean).strip()
+        
+        # Определяем, является ли часть улицей (содержит ключевые слова улиц)
+        is_street_type = re.search(r'\b(ул|улица|пр-т|проспект|пер|переулок|наб|набережная|б-р|бульвар|ш|шоссе|пр|проезд)\b', p_clean, re.IGNORECASE)
+        
+        # Если это тип улицы, но без слова "ул." - добавляем
+        if is_street_type and not p_clean.lower().startswith('ул'):
+            street_type = is_street_type.group(1).lower()
+            if street_type in ['ул', 'улица']:
+                p_clean = re.sub(r'\b(ул|улица)\b', 'ул.', p_clean, flags=re.IGNORECASE)
+                street_detected = True
+        
+        # Если это явно название улицы без указания типа - добавляем "ул."
+        elif not street_detected and not re.match(r'^\d', p_clean) and len(p_clean.split()) > 1:
+            # Проверяем, не содержит ли уже тип улицы
+            if not re.search(r'\b(ул\.|проспект|пер\.|бульвар|шоссе|набережная|пл\.)\b', p_clean, re.IGNORECASE):
+                # Добавляем "ул." только если это похоже на название улицы
+                if re.search(r'[а-яё]+\s+[а-яё]+', p_clean.lower()):
+                    p_clean = f"ул. {p_clean}"
+                    street_detected = True
         
         if len(p_clean) > 1:
             clean_parts.append(p_clean)
             
-            # СТОП-КРАН
-            is_house_number = re.match(r'^(\d+(?:[а-яА-Я]|\/|\-)?\d*|д\.|корп|стр|дом)\b', p_clean, re.IGNORECASE)
+            # --- ИСПРАВЛЕННОЕ ПРАВИЛО "СТОП-КРАН" ---
+            # Определяем, является ли часть номером дома
+            is_house_number = re.match(r'^(\d+(?:[а-яА-Я]|\/|\-)?\d*|д\.|дом)\b', p_clean, re.IGNORECASE)
+            
+            # Определяем, является ли часть улицей с номером (1-я, 8-го и т.д.)
             is_street_with_digit = re.match(r'^\d+-?(ая|я|й|го)\b', p_clean, re.IGNORECASE)
-
+            
+            # Определяем, является ли часть корпусом/строением (начинается с к/стр/корп)
+            is_building_part = re.match(r'^(к|корп|стр|строение|с)\.?\s*\d*', p_clean, re.IGNORECASE)
+            
+            # ПРЕРЫВАЕМ цикл только если это номер дома И следующая часть НЕ является корпусом/строением
             if is_house_number and not is_street_with_digit:
-                 # Проверяем, нет ли слова "стр" или "корп" дальше в этой же части
-                 if not re.search(r'(стр|корп|к\.)\s*\d+', p_clean, re.I):
-                    break 
+                # Проверяем, есть ли следующая часть и является ли она корпусом/строением
+                if len(parts) > parts.index(p) + 1:
+                    next_part = parts[parts.index(p) + 1].strip().lower()
+                    next_is_building = re.match(r'^(к|корп|стр|строение|с)\.?\s*\d*', next_part, re.IGNORECASE)
+                    if not next_is_building:
+                        break
+                else:
+                    break
 
     # Сборка
     res = ", ".join(clean_parts)
     if not res.startswith("Москва"):
         res = "Москва, " + res.lstrip(" ,")
 
-    # 6. ФИНАЛЬНОЕ ФОРМАТИРОВАНИЕ (ВАШИ ПРАВКИ ТУТ)
-    # Ставим точку после ул
+    # 6. ФИНАЛЬНОЕ ФОРМАТИРОВАНИЕ с дополнительными исправлениями
+    # Унификация обозначений улиц
     res = re.sub(r'\bул\b(?!\.)', 'ул.', res, flags=re.IGNORECASE)
+    res = re.sub(r'\bпер\b(?!\.)', 'пер.', res, flags=re.IGNORECASE)
     
-    # Склеиваем дома и корпуса: 10, к.1 -> 10к1; 12, корп.2 -> 12к2
-    res = re.sub(r'(\d+)\s*[, ]\s*(?:корп\.?|к\.)\s*(\d+)', r'\1к\2', res, flags=re.IGNORECASE)
+    # Преобразование сокращений
+    res = re.sub(r'\bпр-т\b', 'проспект', res, flags=re.IGNORECASE)
+    res = re.sub(r'\bнаб\.\b', 'набережная', res, flags=re.IGNORECASE)
     
-    # Удаляем слово "д." перед номером дома, если перед ним запятая
-    res = re.sub(r',\s*(?:д\.|дом)\s*(\d+)', r', \1', res, flags=re.IGNORECASE)
+    # Объединение номера дома и корпуса/строения
+    res = re.sub(r'(\d+)\s*[, ]\s*(?:корп\.?|к\.|к)\s*(\d+)', r'\1к\2', res, flags=re.IGNORECASE)
+    res = re.sub(r'(\d+)\s*[, ]\s*(?:стр\.?|строение|с)\s*(\d+)', r'\1 стр. \2', res, flags=re.IGNORECASE)
     
-    # Исправляем формат строений: 10стр12 -> 10 стр. 12
-    res = re.sub(r'(\d+)\s*(?:стр\.?|с\.)\s*(\d+)', r'\1 стр. \2', res, flags=re.IGNORECASE)
+    # Удаление "д." и "дом" с объединением номера
+    res = re.sub(r'(?<=\D|^)(?:д\.|дом)\s*(\d+)', r'\1', res, flags=re.IGNORECASE)
     
-    # Если между названием улицы и цифрой дома нет запятой — ставим её
-    # Пример: Университетский пр-т 23 -> Университетский пр-т, 23
-    res = re.sub(r'([а-яё\.]{2,})\s+(\d+[а-я]?)\b', r'\1, \2', res, flags=re.IGNORECASE)
-
-    # Финальная чистка
+    # Объединение разделенных номера дома (например "д 23, к1" -> "23к1")
+    res = re.sub(r'(\d+)\s*[, ]\s*(к\d+)', r'\1\2', res, flags=re.IGNORECASE)
+    
+    # Объединение буквы с номером дома
+    res = re.sub(r'(\d+)\s+([А-Яа-я])\b', r'\1\2', res)
+    
+    # Разделение названия улицы и номера дома, если они слиты
+    res = re.sub(r'([а-яА-ЯёЁ]{3,})\s+(\d+)', r'\1, \2', res)
+    
+    # Чистка лишних запятых и пробелов
     res = re.sub(r'\s+', ' ', res)
     res = re.sub(r'[,]{2,}', ',', res)
-    res = res.replace("Москва, Москва", "Москва")
+    res = re.sub(r',\s*,', ', ', res)
+    
+    # Удаление запятой перед корпусом/строением
+    res = re.sub(r',\s*(к\d+|стр\.\s*\d+)', r' \1', res)
     
     return res.strip(' ,.')
 
