@@ -28,7 +28,7 @@ async def start_web_server():
     site = web.TCPSite(runner, "0.0.0.0", int(os.getenv("PORT", 8080)))
     await site.start()
 
-# --- ИСПРАВЛЕННАЯ ФУНКЦИЯ ОЧИСТКИ АДРЕСА ---
+# --- ИСПРАВЛЕННАЯ ФУНКЦИЯ ОЧИСТКИ АДРЕСА (без lookbehind) ---
 def clean_address(text):
     # 1. Извлечение блока
     pattern = re.compile(r"Вид деятельности по ОКПД(.*?)Грузополучатель", re.DOTALL | re.IGNORECASE)
@@ -101,7 +101,7 @@ def clean_address(text):
         elif not street_detected and not re.match(r'^\d', p_clean) and len(p_clean.split()) >= 1:
             # Проверяем, не содержит ли уже тип улицы
             if not re.search(r'\b(ул\.|проспект|пер\.|бульвар|шоссе|набережная|пл\.)\b', p_clean, re.IGNORECASE):
-                # Добавляем "ул." только если это похоже на название улицы (содержит 2+ слова или длинное слово)
+                # Добавляем "ул." только если это похоже на название улицы
                 if re.search(r'[а-яё]{3,}', p_clean.lower()):
                     # Проверяем, что это не номер дома
                     if not re.match(r'^\d+[а-я]?$', p_clean):
@@ -116,7 +116,7 @@ def clean_address(text):
     if not res.startswith("Москва"):
         res = "Москва, " + res.lstrip(" ,")
 
-    # 6. ФИНАЛЬНОЕ ФОРМАТИРОВАНИЕ
+    # 6. ФИНАЛЬНОЕ ФОРМАТИРОВАНИЕ (без lookbehind)
     # Удаление двойных "ул."
     res = re.sub(r'ул\.\s+ул\.', 'ул.', res, flags=re.IGNORECASE)
     
@@ -128,11 +128,16 @@ def clean_address(text):
     res = re.sub(r'\bпр-т\b', 'проспект', res, flags=re.IGNORECASE)
     res = re.sub(r'\bнаб\.\b', 'набережная', res, flags=re.IGNORECASE)
     
-    # Удаление "д." и "дом" в разных позициях
-    # В начале адресной части
-    res = re.sub(r'(?<=,\s|^)(?:д\.|дом)\s*(\d+)', r'\1', res, flags=re.IGNORECASE)
-    # В середине (после названия улицы)
-    res = re.sub(r'([а-яё])\s+(?:д\.|дом)\s*(\d+)', r'\1, \2', res, flags=re.IGNORECASE)
+    # Удаление "д." и "дом" - РАЗДЕЛЕННЫЙ ПОДХОД БЕЗ LOOKBEHIND
+    # Сначала обработаем начало строки
+    if res.lower().startswith('д.') or res.lower().startswith('дом'):
+        res = re.sub(r'^(?:д\.|дом)\s+', '', res, flags=re.IGNORECASE)
+    
+    # Затем обработаем все вхождения после запятых
+    res = re.sub(r',\s*(?:д\.|дом)\s+', ', ', res, flags=re.IGNORECASE)
+    
+    # Обработаем в середине строки
+    res = re.sub(r'(\D)(?:д\.|дом)\s+(\d)', r'\1\2', res, flags=re.IGNORECASE)
     
     # Объединение номера дома и корпуса/строения
     res = re.sub(r'(\d+)\s*[, ]?\s*(?:корп\.?|к\.?|к)\s*(\d+)', r'\1к\2', res, flags=re.IGNORECASE)
@@ -157,6 +162,9 @@ def clean_address(text):
     
     # Удаление "д." в конце адреса
     res = re.sub(r',\s*д\.\s*$', '', res, flags=re.IGNORECASE)
+    
+    # Дополнительная обработка для удаления оставшихся "д." и "дом"
+    res = re.sub(r'\s+(?:д\.|дом)\s+', ' ', res, flags=re.IGNORECASE)
     
     return res.strip(' ,.')
 
