@@ -28,13 +28,13 @@ async def start_web_server():
     site = web.TCPSite(runner, "0.0.0.0", int(os.getenv("PORT", 8080)))
     await site.start()
 
-# --- ЭТАЛОННАЯ ОЧИСТКА АДРЕСА (V9/V15 - НЕ МЕНЯЕМ!) ---
+# --- ЭТАЛОННАЯ ОЧИСТКА АДРЕСА (НЕ ТРОГАЕМ!) ---
 def clean_address(text):
     # 1. Извлечение блока
-    pattern = re.compile(r"Грузополучатель(.*?)(?:Поставщик|Основание|Номер|Транспортная)", re.DOTALL | re.IGNORECASE)
+    pattern = re.compile(r"Вид деятельности по ОКПД(.*?)Грузополучатель", re.DOTALL | re.IGNORECASE)
     match = pattern.search(text)
     if not match:
-        pattern = re.compile(r"Вид деятельности по ОКПД(.*?)Грузополучатель", re.DOTALL | re.IGNORECASE)
+        pattern = re.compile(r"Грузополучатель(.*?)(?:Поставщик|Основание|Номер|Транспортная)", re.DOTALL | re.IGNORECASE)
         match = pattern.search(text)
     
     if not match: return None
@@ -44,14 +44,14 @@ def clean_address(text):
     raw = re.sub(r'["«»]', '', raw)
     raw = re.sub(r'\b\d{6}\b', '', raw)
 
-    # 3. УДАЛЕНИЕ МУСОРА
+    # 3. ТОТАЛЬНОЕ УДАЛЕНИЕ МУСОРА
     junk_patterns = [
-        r'вн\.?тер\.?\s*г\.?[^,]*', 
+        r'вн\.?тер\.?[^,]*',                    # Удаляет "вн.тер.Ростокино" и всё до запятой
         r'муниципальный округ[^,]*', 
         r'\b(филиал|инн|кпп|бик|огрн|окпо)\b', 
         r'\b(ип|ооо|пао|ао|зао)\b.*?(?=москва|ул|пр|наб|$)', 
-        r'\d{10,25}',
-        r'\b(р/с|к/с|рс|кс)\b.*',
+        r'\d{10,25}',                           # Длинные счета
+        r'\b(р/с|к/с|рс|кс)\b.*',               # Удаляет р/с и всё что после него
         r'банковские реквизиты.*',
         r'тел\..*'
     ]
@@ -64,13 +64,14 @@ def clean_address(text):
     if match_anchor:
         raw = raw[match_anchor.start():]
 
-    # 5. РАЗБИВКА И ФИЛЬТРАЦИЯ
+    # 5. РАЗБИВКА И ФИЛЬТРАЦИЯ ЧАСТЕЙ
     parts = raw.split(',')
     clean_parts = []
     seen_moscow = False
 
     for p in parts:
         p_clean = p.strip()
+        # Удаляем "г."
         p_clean = re.sub(r'\b(г\.|г|город)\b\.?\s*', '', p_clean, flags=re.IGNORECASE)
         
         if not p_clean: continue
@@ -81,37 +82,40 @@ def clean_address(text):
                 seen_moscow = True
             continue
         
+        # Убираем ФИО
         p_clean = re.sub(r'^([А-ЯЁ][а-яё]+\s*){2,3}', '', p_clean).strip()
         
         if len(p_clean) > 1:
             clean_parts.append(p_clean)
-            # Стоп-кран после номера дома
+            
+            # --- ПРАВИЛО "СТОП-КРАН" ---
             is_house_number = re.match(r'^(\d+(?:[а-яА-Я]|\/|\-)?\d*|д\.|корп|стр|дом)\b', p_clean, re.IGNORECASE)
-            is_street_with_digit = re.match(r'^\d+-?(ая|я|й|го)\b', p_clean, re.IGNORECASE)
+            is_street_with_digit = re.match(r'^\d+-?(ая|я|й|го)\b', p_clean, re.IGNORECASE) # 1-я улица, 8-го марта
 
             if is_house_number and not is_street_with_digit:
-                 break 
+                 break # <--- ПРЕРЫВАЕМ ЦИКЛ
 
     # Сборка
     res = ", ".join(clean_parts)
     if not res.startswith("Москва"):
         res = "Москва, " + res.lstrip(" ,")
 
-    # 6. ФОРМАТИРОВАНИЕ
+    # 6. ФИНАЛЬНОЕ ФОРМАТИРОВАНИЕ
     res = re.sub(r'\bул\b(?!\.)', 'ул.', res, flags=re.IGNORECASE)
     res = re.sub(r'(\d+)\s*[, ]\s*(?:корп\.?|к\.)\s*(\d+)', r'\1к\2', res, flags=re.IGNORECASE)
     res = re.sub(r'(\d+)\s+([А-Яа-я])\b', r'\1\2', res)
     res = re.sub(r',\s*(?:д\.|дом)\s*', ', ', res, flags=re.IGNORECASE)
     res = re.sub(r'([а-яА-ЯёЁ]{3,})\s+(\d+)', r'\1, \2', res)
 
+    # Чистка знаков
     res = re.sub(r'\s+', ' ', res)
     res = re.sub(r'[,]{2,}', ',', res)
     return res.strip(' ,.')
 
-# --- ГЕОКОДИНГ ---
+# --- Логика Геокодинга и Маршрутов ---
 def get_coords(address):
     try:
-        geolocator = Nominatim(user_agent="logistic_v16_safe")
+        geolocator = Nominatim(user_agent="logistic_v17_stable")
         location = geolocator.geocode(address, timeout=10)
         return (location.latitude, location.longitude) if location else None
     except: return None
@@ -119,13 +123,14 @@ def get_coords(address):
 @dp.message(Command("start"))
 async def start(message: types.Message):
     user_data[message.from_user.id] = {'addresses': []}
-    await message.answer("Бот V16. Оптимизирован для массовой загрузки (без флуда).")
+    await message.answer("Бот V17 готов. Загрузка файлов оптимизирована (без ошибок флуда).")
 
 @dp.message(F.document)
 async def handle_docs(message: types.Message):
     if not message.document.file_name.lower().endswith('.pdf'): return
     
-    # УБРАЛ send_chat_action и временные сообщения, чтобы не было ошибки Flood control
+    # --- ИСПРАВЛЕНИЕ: Убрали send_chat_action и лишние сообщения ---
+    # Это предотвращает ошибку Flood control при массовой загрузке
     
     uid = str(uuid.uuid4())
     temp_fn = f"temp_{uid}.pdf"
@@ -136,8 +141,8 @@ async def handle_docs(message: types.Message):
             text = "".join([p.extract_text() or "" for p in pdf.pages])
             addr = clean_address(text)
             
-            # Небольшая пауза, чтобы ответы не слипались и не блокировались
-            await asyncio.sleep(0.3)
+            # Небольшая задержка, чтобы ответы не летели "пулеметом" и не блокировались
+            await asyncio.sleep(0.5)
 
             if addr:
                 if message.from_user.id not in user_data: user_data[message.from_user.id] = {'addresses': []}
@@ -153,9 +158,9 @@ async def ask_drivers(message: types.Message):
     u_id = message.from_user.id
     if u_id not in user_data or not user_data[u_id]['addresses']:
         await message.answer("Сначала пришли PDF!"); return
-    kb = [[KeyboardButton(text=str(i)) for i in range(1, 7)]]
+    kb = [[KeyboardButton(text=str(i)) for i in range(1, 4)], [KeyboardButton(text=str(i)) for i in range(4, 7)]]
     markup = ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
-    await message.answer(f"Адресов: {len(user_data[u_id]['addresses'])}. Сколько водителей?", reply_markup=markup)
+    await message.answer(f"Адресов: {len(user_data[u_id]['addresses'])}. Водителей?", reply_markup=markup)
 
 @dp.message(F.text.regexp(r'^\d+$'))
 async def process_logistics(message: types.Message):
@@ -163,16 +168,18 @@ async def process_logistics(message: types.Message):
     user_id = message.from_user.id
     raw_addresses = list(set(user_data[user_id]['addresses']))
     
-    # Здесь оставляем индикацию, т.к. это разовое действие
-    progress = await message.answer("🔄 **Загрузка:** Строю маршруты...")
+    progress = await message.answer("🔄 Строю маршруты...")
     
+    # Здесь можно оставить Action, так как есть долгая пауза в цикле
+    await bot.send_chat_action(message.chat.id, "find_location")
+
     data = []
     for addr in raw_addresses:
-        # Chat action внутри цикла - ОК, так как есть sleep
-        await bot.send_chat_action(message.chat.id, "find_location")
         coords = get_coords(addr)
         if not coords: coords = get_coords(", ".join(addr.split(',')[:2]))
         if coords: data.append({'address': addr, 'lat': coords[0], 'lon': coords[1]})
+        
+        # Пауза важна для геокодера, она же спасает от флуда
         await asyncio.sleep(1.1)
 
     if not data:
@@ -189,7 +196,8 @@ async def process_logistics(message: types.Message):
         driver_points = df[df['driver'] == i]
         res = f"🚛 **МАРШРУТ №{i+1}**\n"
         for _, row in driver_points.iterrows():
-            res += f"📍 {row['address'].replace('Москва, ', '')}\n"
+            final_view = row['address'].replace("Москва, ", "")
+            res += f"📍 {final_view}\n"
         await message.answer(res, parse_mode="Markdown")
     user_data[user_id] = {'addresses': []}
 
