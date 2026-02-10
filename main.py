@@ -7,7 +7,7 @@ import pdfplumber
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Set
 import aiohttp
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
@@ -19,12 +19,13 @@ from aiogram.types import (
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from sklearn.cluster import KMeans
+from geopy.geocoders import Nominatim
 from aiohttp import web
 
 # Загрузка конфигурации
 TOKEN = os.getenv("BOT_TOKEN")
 TOMTOM_API_KEY = os.getenv("TOMTOM_API_KEY")
-PRODUCTION_ADDRESS = os.getenv("PRODUCTION_ADDRESS", "Москва, ул. Производственная, 1")
+PRODUCTION_ADDRESS = os.getenv("PRODUCTION_ADDRESS", "Москва, ул. Лавочкина, 34")
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
@@ -35,8 +36,8 @@ user_data: Dict[int, Dict] = {}
 class DistributionStates(StatesGroup):
     waiting_for_drivers = State()
     waiting_for_departure_time = State()
-    waiting_for_return_choice = State()
     editing_routes = State()
+    setting_return_to_base = State()
 
 # --- Сервер для Render ---
 async def handle_health(request):
@@ -213,40 +214,103 @@ def clean_address(text):
     
     return res.strip(' ,.')
 
-# --- TomTom API функции ---
+# --- Геокодирование через несколько сервисов ---
+async def geocode_with_fallback(address: str) -> Optional[Tuple[float, float]]:
+    """Геокодирование через TomTom, с fallback на Nominatim"""
+    # Пробуем TomTom
+    coords = await tomtom_geocode(address)
+    if coords:
+        print(f"✅ TomTom геокодирование успешно: {address}")
+        return coords
+    
+    # Fallback на Nominatim
+    print(f"⚠️ TomTom не смог, пробую Nominatim: {address}")
+    coords = await nominatim_geocode(address)
+    if coords:
+        print(f"✅ Nominatim геокодирование успешно: {address}")
+    else:
+        print(f"❌ Ошибка геокодирования: {address}")
+    
+    return coords
+
 async def tomtom_geocode(address: str) -> Optional[Tuple[float, float]]:
     """Геокодирование адреса с помощью TomTom API"""
     try:
-        url = f"https://api.tomtom.com/search/2/geocode/{address}.json"
+        # Кодируем адрес для URL
+        encoded_address = aiohttp.helpers.quote(address)
+        url = f"https://api.tomtom.com/search/2/geocode/{encoded_address}.json"
         params = {
             "key": TOMTOM_API_KEY,
             "limit": 1,
             "countrySet": "RU",
-            "language": "ru-RU"
+            "language": "ru-RU",
+            "typeahead": "false"
         }
         
         async with aiohttp.ClientSession() as session:
-            async with session.get(url, params=params) as response:
+            async with session.get(url, params=params, timeout=10) as response:
                 if response.status == 200:
                     data = await response.json()
                     if data.get("results") and len(data["results"]) > 0:
                         position = data["results"][0]["position"]
                         return (position["lat"], position["lon"])
+                else:
+                    print(f"TomTom геокодирование ошибка {response.status}: {address}")
         return None
     except Exception as e:
-        print(f"TomTom geocoding error: {e}")
+        print(f"TomTom геокодирование исключение: {e} для {address}")
         return None
 
+async def nominatim_geocode(address: str) -> Optional[Tuple[float, float]]:
+    """Геокодирование через Nominatim как fallback"""
+    try:
+        # Добавляем явное указание на Москву, если его нет
+        if "Москва" not in address:
+            address_to_geocode = f"Москва, {address}"
+        else:
+            address_to_geocode = address
+            
+        geolocator = Nominatim(user_agent="logistics_bot_v3", timeout=10)
+        location = geolocator.geocode(address_to_geocode)
+        if location:
+            return (location.latitude, location.longitude)
+        return None
+    except Exception as e:
+        print(f"Nominatim геокодирование ошибка: {e} для {address}")
+        return None
+
+async def batch_geocode(addresses: List[str]) -> Tuple[Dict[str, Tuple[float, float]], List[str]]:
+    """Пакетное геокодирование адресов с возвратом успешных и неудачных"""
+    coords_dict = {}
+    failed_addresses = []
+    
+    for i, address in enumerate(addresses):
+        print(f"Геокодирование {i+1}/{len(addresses)}: {address}")
+        coords = await geocode_with_fallback(address)
+        if coords:
+            coords_dict[address] = coords
+        else:
+            failed_addresses.append(address)
+        await asyncio.sleep(0.2)  # Пауза для соблюдения лимитов API
+    
+    return coords_dict, failed_addresses
+
+# --- TomTom Routing API ---
 async def tomtom_calculate_route(waypoints: List[Tuple[float, float]], 
                                 departure_time: Optional[str] = None,
                                 return_to_start: bool = False) -> Dict:
     """Расчет маршрута с помощью TomTom API"""
     try:
-        # Форматируем waypoints для API
-        if return_to_start and len(waypoints) > 1:
-            # Добавляем стартовую точку в конец маршрута
+        if len(waypoints) < 2:
+            print("Слишком мало точек для маршрута")
+            return {}
+        
+        # Если требуется возврат, добавляем стартовую точку в конец
+        if return_to_start:
+            waypoints = waypoints.copy()
             waypoints.append(waypoints[0])
         
+        # Форматируем waypoints для API
         waypoints_str = ":".join([f"{lat},{lon}" for lat, lon in waypoints])
         
         url = f"https://api.tomtom.com/routing/1/calculateRoute/{waypoints_str}/json"
@@ -263,78 +327,90 @@ async def tomtom_calculate_route(waypoints: List[Tuple[float, float]],
             "instructionsType": "text",
             "language": "ru-RU",
             "vehicleCommercial": "true",
-            "vehicleLoadType": "generalGoods"
+            "vehicleLoadType": "generalGoods",
+            "avoid": "unpavedRoads"
         }
         
         if departure_time:
-            params["departAt"] = departure_time
+            try:
+                # Преобразуем время в нужный формат
+                if "T" not in departure_time:
+                    departure_dt = datetime.fromisoformat(departure_time)
+                    departure_time = departure_dt.isoformat()
+                params["departAt"] = departure_time
+            except:
+                print(f"Ошибка формата времени: {departure_time}")
         
+        print(f"Запрос маршрута с {len(waypoints)} точками")
         async with aiohttp.ClientSession() as session:
-            async with session.get(url, params=params) as response:
+            async with session.get(url, params=params, timeout=30) as response:
                 if response.status == 200:
                     data = await response.json()
+                    print(f"Маршрут получен успешно")
                     return data
                 else:
-                    print(f"TomTom routing error: {response.status}")
+                    error_text = await response.text()
+                    print(f"Ошибка маршрутизации {response.status}: {error_text}")
                     return {}
     except Exception as e:
-        print(f"TomTom routing error: {e}")
+        print(f"Исключение при построении маршрута: {e}")
         return {}
 
-async def tomtom_batch_geocode(addresses: List[str]) -> Dict[str, Tuple[float, float]]:
-    """Пакетное геокодирование адресов"""
-    results = {}
-    for address in addresses:
-        coords = await tomtom_geocode(address)
-        if coords:
-            results[address] = coords
-        await asyncio.sleep(0.1)  # Для соблюдения лимитов API
-    return results
-
 # --- Алгоритмы балансировки маршрутов ---
-def balanced_clustering_by_time(coords_dict: Dict[str, Tuple[float, float]], 
-                               n_clusters: int, 
-                               production_coords: Tuple[float, float]) -> Dict[int, List[str]]:
+def balanced_clustering(coords_dict: Dict[str, Tuple[float, float]], 
+                       n_clusters: int,
+                       production_coords: Tuple[float, float]) -> Dict[int, List[str]]:
     """
-    Сбалансированная кластеризация по времени доставки
-    Используем комбинацию KMeans и балансировки по количеству точек
+    Сбалансированная кластеризация с учетом географии
     """
     addresses = list(coords_dict.keys())
     coords = np.array([coords_dict[addr] for addr in addresses])
     
-    # Инициализация KMeans
+    if len(addresses) <= n_clusters:
+        # Если адресов меньше или равно количеству кластеров
+        result = {}
+        for i in range(n_clusters):
+            result[i] = addresses[i:i+1] if i < len(addresses) else []
+        return result
+    
+    # Используем KMeans для начальной кластеризации
     kmeans = KMeans(n_clusters=n_clusters, n_init=10, random_state=42)
     labels = kmeans.fit_predict(coords)
     
-    # Балансировка по количеству точек в кластерах
+    # Балансировка по количеству точек
     cluster_sizes = np.bincount(labels, minlength=n_clusters)
     target_size = len(addresses) // n_clusters
-    max_per_cluster = target_size + (1 if len(addresses) % n_clusters > 0 else 0)
+    max_size = target_size + (1 if len(addresses) % n_clusters else 0)
     
-    # Перераспределяем точки из переполненных кластеров в недозаполненные
-    for _ in range(50):  # Максимум 50 итераций
-        if np.max(cluster_sizes) <= max_per_cluster and np.min(cluster_sizes) >= target_size:
+    # Итеративная балансировка
+    for iteration in range(100):
+        # Находим самый большой и самый маленький кластер
+        max_cluster = np.argmax(cluster_sizes)
+        min_cluster = np.argmin(cluster_sizes)
+        
+        # Проверяем баланс
+        if cluster_sizes[max_cluster] <= max_size and cluster_sizes[min_cluster] >= target_size:
             break
         
-        overloaded = np.argmax(cluster_sizes)
-        underloaded = np.argmin(cluster_sizes)
-        
-        if cluster_sizes[overloaded] <= cluster_sizes[underloaded] + 1:
-            break
-        
-        # Находим точку в переполненном кластере, ближайшую к центру недозаполненного
-        overloaded_points = np.where(labels == overloaded)[0]
-        overloaded_coords = coords[overloaded_points]
-        underloaded_center = kmeans.cluster_centers_[underloaded]
-        
-        distances = np.linalg.norm(overloaded_coords - underloaded_center, axis=1)
-        idx_to_move = np.argmin(distances)
-        point_idx = overloaded_points[idx_to_move]
-        
-        # Перемещаем точку
-        labels[point_idx] = underloaded
-        cluster_sizes[overloaded] -= 1
-        cluster_sizes[underloaded] += 1
+        # Если самый большой кластер слишком большой
+        if cluster_sizes[max_cluster] > max_size:
+            # Находим точки в большом кластере
+            max_cluster_points = np.where(labels == max_cluster)[0]
+            
+            # Вычисляем расстояния до центра маленького кластера
+            max_cluster_coords = coords[max_cluster_points]
+            min_cluster_center = kmeans.cluster_centers_[min_cluster]
+            
+            distances = np.linalg.norm(max_cluster_coords - min_cluster_center, axis=1)
+            
+            # Выбираем ближайшую точку для перемещения
+            idx_to_move = np.argmin(distances)
+            point_idx = max_cluster_points[idx_to_move]
+            
+            # Перемещаем точку
+            labels[point_idx] = min_cluster
+            cluster_sizes[max_cluster] -= 1
+            cluster_sizes[min_cluster] += 1
     
     # Формируем результат
     result = {}
@@ -344,75 +420,30 @@ def balanced_clustering_by_time(coords_dict: Dict[str, Tuple[float, float]],
     
     return result
 
-# --- Функции для редактирования маршрутов ---
-def create_route_keyboard(routes: Dict[int, List[str]], current_route: int = None) -> InlineKeyboardMarkup:
-    """Создает клавиатуру для редактирования маршрутов"""
-    keyboard = []
-    
-    # Кнопки для выбора маршрута
-    for route_id in sorted(routes.keys()):
-        route_name = f"Маршрут {route_id+1} ({len(routes[route_id])} адр.)"
-        keyboard.append([
-            InlineKeyboardButton(
-                text=route_name,
-                callback_data=f"select_route_{route_id}"
-            )
-        ])
-    
-    # Кнопки управления
-    keyboard.append([
-        InlineKeyboardButton(text="✅ Завершить редактирование", callback_data="finish_editing"),
-        InlineKeyboardButton(text="📊 Статистика", callback_data="show_stats")
-    ])
-    
-    return InlineKeyboardMarkup(inline_keyboard=keyboard)
-
-def create_address_keyboard(addresses: List[str], route_id: int) -> InlineKeyboardMarkup:
-    """Создает клавиатуру с адресами для перемещения"""
-    keyboard = []
-    
-    for i, address in enumerate(addresses):
-        short_address = address.replace("Москва, ", "")[:30] + ("..." if len(address) > 30 else "")
-        keyboard.append([
-            InlineKeyboardButton(
-                text=f"📍 {short_address}",
-                callback_data=f"move_address_{route_id}_{i}"
-            )
-        ])
-    
-    keyboard.append([
-        InlineKeyboardButton(text="◀️ Назад к маршрутам", callback_data="back_to_routes")
-    ])
-    
-    return InlineKeyboardMarkup(inline_keyboard=keyboard)
-
 # --- Обработчики команд ---
 @dp.message(Command("start"))
 async def start(message: types.Message):
-    user_data[message.from_user.id] = {
+    user_id = message.from_user.id
+    user_data[user_id] = {
         'addresses': [],
         'processed_files': 0,
-        'routes': None,
+        'routes_info': None,
+        'address_coords': {},
         'production_coords': None,
         'departure_time': None,
-        'return_to_base': {}
+        'return_to_base': {},  # driver_id -> bool
+        'need_return_config': False
     }
     
-    # Получаем координаты производства
-    production_coords = await tomtom_geocode(PRODUCTION_ADDRESS)
-    if production_coords:
-        user_data[message.from_user.id]['production_coords'] = production_coords
-    
     await message.answer(
-        "🚛 *Логистический бот V2.0* 🚛\n\n"
-        "📋 *Возможности:*\n"
+        "🚛 *Логистический бот V3.0* 🚛\n\n"
+        "📋 *Улучшенные возможности:*\n"
         "• Обработка PDF-накладных\n"
-        "• Геокодирование через TomTom\n"
-        "• Оптимальные маршруты с учетом трафика\n"
-        "• Балансировка между водителями\n"
+        "• Геокодирование через TomTom + Nominatim\n"
+        "• Сбалансированное распределение\n"
         "• Редактирование маршрутов\n"
-        "• Учет возврата на базу\n\n"
-        "📎 *Отправьте PDF-файлы с накладными*",
+        "• Настройка возврата на базу\n\n"
+        "📎 *Отправьте все PDF-файлы, затем введите /distribute*",
         parse_mode="Markdown"
     )
 
@@ -426,10 +457,12 @@ async def handle_docs(message: types.Message):
         user_data[user_id] = {
             'addresses': [],
             'processed_files': 0,
-            'routes': None,
+            'routes_info': None,
+            'address_coords': {},
             'production_coords': None,
             'departure_time': None,
-            'return_to_base': {}
+            'return_to_base': {},
+            'need_return_config': False
         }
     
     # Показываем индикатор обработки
@@ -447,7 +480,10 @@ async def handle_docs(message: types.Message):
             await processing_msg.delete()
             
             if addr:
-                user_data[user_id]['addresses'].append(addr)
+                # Проверяем, нет ли уже этого адреса
+                if addr not in user_data[user_id]['addresses']:
+                    user_data[user_id]['addresses'].append(addr)
+                
                 user_data[user_id]['processed_files'] += 1
                 
                 total_addresses = len(user_data[user_id]['addresses'])
@@ -458,7 +494,7 @@ async def handle_docs(message: types.Message):
                     f"📍 *Адрес:* {addr}\n\n"
                     f"📊 *Статистика:*\n"
                     f"• Обработано файлов: {total_files}\n"
-                    f"• Всего адресов: {total_addresses}\n\n"
+                    f"• Уникальных адресов: {total_addresses}\n\n"
                     f"📎 *Отправьте следующий файл или введите /distribute для распределения*",
                     parse_mode="Markdown"
                 )
@@ -482,18 +518,10 @@ async def start_distribution(message: types.Message, state: FSMContext):
         await message.answer("❌ Нет адресов для распределения. Сначала отправьте PDF-файлы.")
         return
     
-    # Проверяем координаты производства
-    if not user_data[user_id]['production_coords']:
-        production_coords = await tomtom_geocode(PRODUCTION_ADDRESS)
-        if not production_coords:
-            await message.answer("❌ Ошибка геокодирования адреса производства")
-            return
-        user_data[user_id]['production_coords'] = production_coords
-    
-    # Запрашиваем количество водителей
+    addresses = user_data[user_id]['addresses']
     await message.answer(
         f"📊 *Готово к распределению!*\n"
-        f"• Всего адресов: {len(user_data[user_id]['addresses'])}\n"
+        f"• Всего адресов: {len(addresses)}\n"
         f"• Адрес производства: {PRODUCTION_ADDRESS}\n\n"
         f"🚚 *Введите количество водителей (1-10):*",
         parse_mode="Markdown"
@@ -560,43 +588,46 @@ async def process_departure_time(message: types.Message, state: FSMContext):
     
     user_data[user_id]['departure_time'] = departure_time
     
-    # Запрашиваем информацию о возврате на базу
+    # Переходим к настройке возврата на базу
+    await ask_return_to_base_setup(message, state)
+
+async def ask_return_to_base_setup(message: types.Message, state: FSMContext):
+    """Запрашиваем настройку возврата на базу"""
+    user_id = message.from_user.id
+    
     await message.answer(
-        "🔄 *Настройка возврата на базу:*\n"
-        "Некоторые водители могут возвращаться на производство после завершения маршрута.\n"
-        "Это повлияет на расчет оптимального порядка адресов.\n\n"
-        "По умолчанию водители НЕ возвращаются на базу.\n"
-        "Хотите настроить возврат для некоторых водителей?",
+        "🔄 *Настройка возврата на базу:*\n\n"
+        "Хотите настроить, какие водители возвращаются на производство после завершения маршрута?\n\n"
+        "✅ *Да* - сможете указать для каждого водителя отдельно\n"
+        "❌ *Нет* - все водители не возвращаются на базу",
         reply_markup=ReplyKeyboardMarkup(
             keyboard=[
-                [KeyboardButton(text="Да, настроить")],
-                [KeyboardButton(text="Нет, продолжить")]
+                [KeyboardButton(text="✅ Да, настроить")],
+                [KeyboardButton(text="❌ Нет, пропустить")]
             ],
             resize_keyboard=True
         )
     )
-    await state.set_state(DistributionStates.waiting_for_return_choice)
+    await state.set_state(DistributionStates.setting_return_to_base)
 
-@dp.message(DistributionStates.waiting_for_return_choice)
-async def process_return_choice(message: types.Message, state: FSMContext):
+@dp.message(DistributionStates.setting_return_to_base)
+async def process_return_setup(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
     
-    if message.text == "Да, настроить":
+    if message.text == "✅ Да, настроить":
+        user_data[user_id]['need_return_config'] = True
         await message.answer(
-            "🔄 *Настройка возврата на базу:*\n"
-            "После построения маршрутов вы сможете указать, какие водители возвращаются на производство.\n"
-            "Сейчас продолжим без настроек возврата.",
+            "✅ Возврат на базу будет настроен после распределения адресов.",
             reply_markup=types.ReplyKeyboardRemove()
         )
-        user_data[user_id]['need_return_config'] = True
     else:
         user_data[user_id]['need_return_config'] = False
         await message.answer(
-            "Продолжаем без настройки возврата на базу.",
+            "❌ Возврат на базу не настроен. Все водители завершают маршрут на последнем адресе.",
             reply_markup=types.ReplyKeyboardRemove()
         )
     
-    # Начинаем обработку
+    # Начинаем обработку распределения
     await process_distribution(message, state)
 
 async def process_distribution(message: types.Message, state: FSMContext):
@@ -605,35 +636,49 @@ async def process_distribution(message: types.Message, state: FSMContext):
     # Показываем прогресс
     progress_msg = await message.answer("🔄 *Начинаю обработку...*\n1️⃣ Геокодирование адресов", parse_mode="Markdown")
     
-    # Шаг 1: Геокодирование
-    await progress_msg.edit_text("🔄 *Геокодирование адресов...*\n⏳ Это может занять некоторое время")
-    
-    addresses = list(set(user_data[user_id]['addresses']))
-    coords_dict = await tomtom_batch_geocode(addresses)
-    
-    if not coords_dict:
-        await progress_msg.edit_text("❌ Ошибка геокодирования адресов")
+    # Шаг 1: Геокодирование производства
+    await progress_msg.edit_text("📍 *Геокодирование адреса производства...*")
+    production_coords = await geocode_with_fallback(PRODUCTION_ADDRESS)
+    if not production_coords:
+        await progress_msg.edit_text("❌ Не удалось определить координаты производства")
         return
     
-    await progress_msg.edit_text(f"✅ Геокодирование завершено\n📍 Обработано {len(coords_dict)} из {len(addresses)} адресов")
+    user_data[user_id]['production_coords'] = production_coords
     
-    # Шаг 2: Кластеризация
-    await progress_msg.edit_text("🔄 *Распределение адресов между водителями...*")
+    # Шаг 2: Геокодирование адресов доставки
+    addresses = list(set(user_data[user_id]['addresses']))
+    await progress_msg.edit_text(f"📍 *Геокодирование {len(addresses)} адресов доставки...*\n⏳ Это может занять время")
     
-    production_coords = user_data[user_id]['production_coords']
-    num_drivers = user_data[user_id]['num_drivers']
+    coords_dict, failed_addresses = await batch_geocode(addresses)
     
-    # Используем сбалансированную кластеризацию
-    clusters = balanced_clustering_by_time(coords_dict, num_drivers, production_coords)
+    if failed_addresses:
+        failed_text = "\n".join([f"• {addr}" for addr in failed_addresses])
+        await message.answer(
+            f"⚠️ *Не удалось геокодировать {len(failed_addresses)} адресов:*\n\n{failed_text}\n\n"
+            f"Эти адреса не будут включены в распределение.",
+            parse_mode="Markdown"
+        )
     
-    # Сохраняем маршруты
-    user_data[user_id]['routes'] = clusters
+    if not coords_dict:
+        await progress_msg.edit_text("❌ Не удалось геокодировать ни один адрес доставки")
+        return
+    
     user_data[user_id]['address_coords'] = coords_dict
     
-    # Шаг 3: Расчет маршрутов
+    await progress_msg.edit_text(f"✅ Геокодирование завершено\n📍 Успешно: {len(coords_dict)} из {len(addresses)} адресов")
+    
+    # Шаг 3: Балансировка и кластеризация
+    await progress_msg.edit_text("🔄 *Распределение адресов между водителями...*")
+    
+    num_drivers = user_data[user_id]['num_drivers']
+    clusters = balanced_clustering(coords_dict, num_drivers, production_coords)
+    
+    # Шаг 4: Расчет маршрутов
     await progress_msg.edit_text("🔄 *Расчет оптимальных маршрутов...*\n⏳ Учитываю трафик и время отправления")
     
     routes_info = {}
+    departure_time = user_data[user_id]['departure_time']
+    
     for driver_id, driver_addresses in clusters.items():
         if driver_addresses:
             # Формируем точки маршрута: производство + адреса
@@ -642,17 +687,26 @@ async def process_distribution(message: types.Message, state: FSMContext):
                 if addr in coords_dict:
                     waypoints.append(coords_dict[addr])
             
-            # Рассчитываем маршрут
+            # Рассчитываем маршрут (пока без возврата)
             route_data = await tomtom_calculate_route(
                 waypoints, 
-                user_data[user_id]['departure_time'],
+                departure_time,
                 return_to_start=False
             )
             
             routes_info[driver_id] = {
                 'addresses': driver_addresses,
                 'route_data': route_data,
-                'waypoints': waypoints
+                'waypoints': waypoints,
+                'return_to_base': False  # По умолчанию
+            }
+        else:
+            # Пустой маршрут
+            routes_info[driver_id] = {
+                'addresses': [],
+                'route_data': {},
+                'waypoints': [production_coords],
+                'return_to_base': False
             }
     
     user_data[user_id]['routes_info'] = routes_info
@@ -661,7 +715,197 @@ async def process_distribution(message: types.Message, state: FSMContext):
     await progress_msg.delete()
     await show_routes(message, user_id)
     
-    # Предлагаем редактирование
+    # Если нужно настроить возврат на базу
+    if user_data[user_id].get('need_return_config'):
+        await setup_return_to_base(message, user_id)
+    else:
+        await offer_editing(message, user_id)
+    
+    await state.clear()
+
+async def show_routes(message: types.Message, user_id: int):
+    """Показать построенные маршруты"""
+    routes_info = user_data[user_id]['routes_info']
+    
+    for driver_id, info in sorted(routes_info.items()):
+        route_data = info.get('route_data', {})
+        addresses = info['addresses']
+        
+        # Извлекаем информацию о маршруте
+        summary = route_data.get('routes', [{}])[0].get('summary', {})
+        total_time = summary.get('travelTimeInSeconds', 0)
+        total_distance = summary.get('lengthInMeters', 0)
+        
+        # Формируем сообщение
+        route_text = f"🚛 *МАРШРУТ {driver_id+1}*\n"
+        
+        if total_time > 0:
+            route_text += f"⏱ Время: {total_time // 60} мин\n"
+        if total_distance > 0:
+            route_text += f"📏 Расстояние: {total_distance / 1000:.1f} км\n"
+        
+        route_text += f"📍 Адресов: {len(addresses)}\n"
+        
+        if info.get('return_to_base'):
+            route_text += f"🔄 Возврат на базу: ✅\n"
+        
+        route_text += "\n"
+        
+        # Добавляем адреса (без города для водителей)
+        for i, addr in enumerate(addresses, 1):
+            short_addr = addr.replace("Москва, ", "")
+            route_text += f"{i}. {short_addr}\n"
+        
+        await message.answer(route_text, parse_mode="Markdown")
+    
+    # Показываем статистику
+    await show_distribution_stats(message, user_id)
+
+async def show_distribution_stats(message: types.Message, user_id: int):
+    """Показать статистику распределения"""
+    routes_info = user_data[user_id]['routes_info']
+    all_addresses = user_data[user_id]['addresses']
+    address_coords = user_data[user_id]['address_coords']
+    
+    stats_text = "📊 *Статистика распределения:*\n\n"
+    total_distributed = 0
+    
+    for driver_id, info in sorted(routes_info.items()):
+        addresses = info['addresses']
+        total_distributed += len(addresses)
+        
+        stats_text += f"🚛 *Маршрут {driver_id+1}:*\n"
+        stats_text += f"   📍 Адресов: {len(addresses)}\n"
+        
+        route_data = info.get('route_data', {})
+        if route_data:
+            summary = route_data.get('routes', [{}])[0].get('summary', {})
+            travel_time = summary.get('travelTimeInSeconds', 0) // 60
+            distance = summary.get('lengthInMeters', 0) / 1000
+            if travel_time > 0:
+                stats_text += f"   ⏱ Время: {travel_time} мин\n"
+            if distance > 0:
+                stats_text += f"   📏 Расстояние: {distance:.1f} км\n"
+        
+        if info.get('return_to_base'):
+            stats_text += f"   🔄 Возврат на базу: ✅\n"
+        
+        stats_text += "\n"
+    
+    stats_text += f"📈 *Итого:*\n"
+    stats_text += f"   📍 Всего адресов: {len(all_addresses)}\n"
+    stats_text += f"   📍 Распределено: {total_distributed}\n"
+    stats_text += f"   📍 Не распределено: {len(all_addresses) - total_distributed}\n"
+    stats_text += f"   🚛 Водителей: {len(routes_info)}"
+    
+    # Показываем нераспределенные адреса
+    distributed_set = set()
+    for info in routes_info.values():
+        distributed_set.update(info['addresses'])
+    
+    not_distributed = [addr for addr in all_addresses if addr not in distributed_set]
+    if not_distributed:
+        stats_text += f"\n\n⚠️ *Нераспределенные адреса:*\n"
+        for addr in not_distributed:
+            short_addr = addr.replace("Москва, ", "")
+            stats_text += f"• {short_addr}\n"
+    
+    await message.answer(stats_text, parse_mode="Markdown")
+
+async def setup_return_to_base(message: types.Message, user_id: int):
+    """Настройка возврата на базу для водителей"""
+    routes_info = user_data[user_id]['routes_info']
+    
+    # Создаем клавиатуру для настройки возврата
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text=f"{'✅' if info.get('return_to_base') else '❌'} Маршрут {driver_id+1} - {len(info['addresses'])} адр.",
+            callback_data=f"toggle_return_{driver_id}"
+        )] for driver_id, info in sorted(routes_info.items())
+    ] + [
+        [InlineKeyboardButton(text="🚀 Завершить настройку", callback_data="finish_return_setup")],
+        [InlineKeyboardButton(text="📊 Показать маршруты", callback_data="show_routes_again")]
+    ])
+    
+    await message.answer(
+        "🔄 *Настройка возврата на базу:*\n\n"
+        "Выберите, какие водители должны вернуться на производство после завершения маршрута.\n"
+        "Нажмите на кнопку маршрута, чтобы переключить состояние возврата.\n\n"
+        "✅ - водитель возвращается на базу\n"
+        "❌ - водитель не возвращается",
+        reply_markup=keyboard
+    )
+
+@dp.callback_query(F.data.startswith("toggle_return_"))
+async def toggle_return_handler(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    driver_id = int(callback.data.split("_")[-1])
+    
+    if user_id in user_data and driver_id in user_data[user_id]['routes_info']:
+        # Переключаем состояние возврата
+        current = user_data[user_id]['routes_info'][driver_id].get('return_to_base', False)
+        user_data[user_id]['routes_info'][driver_id]['return_to_base'] = not current
+        
+        # Обновляем клавиатуру
+        routes_info = user_data[user_id]['routes_info']
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(
+                text=f"{'✅' if info.get('return_to_base') else '❌'} Маршрут {driver_id+1} - {len(info['addresses'])} адр.",
+                callback_data=f"toggle_return_{driver_id}"
+            )] for driver_id, info in sorted(routes_info.items())
+        ] + [
+            [InlineKeyboardButton(text="🚀 Завершить настройку", callback_data="finish_return_setup")],
+            [InlineKeyboardButton(text="📊 Показать маршруты", callback_data="show_routes_again")]
+        ])
+        
+        await callback.message.edit_reply_markup(reply_markup=keyboard)
+        status = "возвращается" if not current else "не возвращается"
+        await callback.answer(f"Маршрут {driver_id+1}: {status} на базу")
+    else:
+        await callback.answer("Ошибка")
+
+@dp.callback_query(F.data == "show_routes_again")
+async def show_routes_again_handler(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    await show_routes(callback.message, user_id)
+    await callback.answer()
+
+@dp.callback_query(F.data == "finish_return_setup")
+async def finish_return_setup_handler(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    
+    # Пересчитываем маршруты для тех, у кого включен возврат
+    routes_info = user_data[user_id]['routes_info']
+    address_coords = user_data[user_id]['address_coords']
+    production_coords = user_data[user_id]['production_coords']
+    departure_time = user_data[user_id]['departure_time']
+    
+    await callback.message.edit_text("🔄 Пересчитываю маршруты с учетом возврата на базу...")
+    
+    for driver_id, info in routes_info.items():
+        if info.get('return_to_base') and info['addresses']:
+            waypoints = [production_coords]
+            for addr in info['addresses']:
+                if addr in address_coords:
+                    waypoints.append(address_coords[addr])
+            
+            # Пересчитываем маршрут с возвратом
+            route_data = await tomtom_calculate_route(
+                waypoints, 
+                departure_time,
+                return_to_start=True
+            )
+            
+            info['route_data'] = route_data
+            info['waypoints'] = waypoints
+    
+    await callback.message.answer("✅ Настройка возврата завершена. Маршруты пересчитаны.")
+    await show_routes(callback.message, user_id)
+    await offer_editing(callback.message, user_id)
+    await callback.answer()
+
+async def offer_editing(message: types.Message, user_id: int):
+    """Предложить редактирование маршрутов"""
     await message.answer(
         "📝 *Хотите отредактировать маршруты?*\n"
         "Вы можете перемещать адреса между водителями для более равномерного распределения.",
@@ -670,57 +914,37 @@ async def process_distribution(message: types.Message, state: FSMContext):
             [InlineKeyboardButton(text="✅ Завершить распределение", callback_data="finish_distribution")]
         ])
     )
-    
-    await state.clear()
 
-async def show_routes(message: types.Message, user_id: int):
-    """Показать построенные маршруты"""
-    routes_info = user_data[user_id]['routes_info']
-    
-    for driver_id, info in routes_info.items():
-        route_data = info.get('route_data', {})
-        
-        # Извлекаем информацию о маршруте
-        summary = route_data.get('routes', [{}])[0].get('summary', {})
-        total_time = summary.get('travelTimeInSeconds', 0) // 60  # в минутах
-        total_distance = summary.get('lengthInMeters', 0) / 1000  # в км
-        
-        # Формируем сообщение
-        route_text = f"🚛 *МАРШРУТ {driver_id+1}*\n"
-        route_text += f"⏱ Время: {total_time} мин\n"
-        route_text += f"📏 Расстояние: {total_distance:.1f} км\n"
-        route_text += f"📍 Адресов: {len(info['addresses'])}\n\n"
-        
-        # Добавляем адреса (без города для водителей)
-        for i, addr in enumerate(info['addresses'], 1):
-            short_addr = addr.replace("Москва, ", "")
-            route_text += f"{i}. {short_addr}\n"
-        
-        await message.answer(route_text, parse_mode="Markdown")
-
-# --- Обработчики инлайн-кнопок ---
+# --- Редактирование маршрутов (упрощенное) ---
 @dp.callback_query(F.data == "edit_routes")
-async def edit_routes_handler(callback: CallbackQuery, state: FSMContext):
+async def edit_routes_handler(callback: CallbackQuery):
     user_id = callback.from_user.id
     
     if user_id not in user_data or 'routes_info' not in user_data[user_id]:
         await callback.answer("Нет данных о маршрутах")
         return
     
-    routes = user_data[user_id]['routes_info']
+    routes_info = user_data[user_id]['routes_info']
     
-    # Создаем клавиатуру для выбора маршрута
-    keyboard = create_route_keyboard({i: info['addresses'] for i, info in routes.items()})
+    # Создаем простую клавиатуру для редактирования
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text=f"🚛 Маршрут {i+1} ({len(info['addresses'])} адр.)",
+            callback_data=f"view_route_{i}"
+        )] for i, info in sorted(routes_info.items())
+    ] + [
+        [InlineKeyboardButton(text="🔄 Обновить маршруты", callback_data="refresh_routes")],
+        [InlineKeyboardButton(text="🏁 Завершить", callback_data="finish_editing")]
+    ])
     
     await callback.message.answer(
         "📋 *Выберите маршрут для редактирования:*",
-        reply_markup=keyboard,
-        parse_mode="Markdown"
+        reply_markup=keyboard
     )
     await callback.answer()
 
-@dp.callback_query(F.data.startswith("select_route_"))
-async def select_route_handler(callback: CallbackQuery, state: FSMContext):
+@dp.callback_query(F.data.startswith("view_route_"))
+async def view_route_handler(callback: CallbackQuery):
     user_id = callback.from_user.id
     route_id = int(callback.data.split("_")[-1])
     
@@ -728,191 +952,43 @@ async def select_route_handler(callback: CallbackQuery, state: FSMContext):
         await callback.answer("Маршрут не найден")
         return
     
-    addresses = user_data[user_id]['routes_info'][route_id]['addresses']
+    info = user_data[user_id]['routes_info'][route_id]
+    addresses = info['addresses']
     
-    # Создаем клавиатуру с адресами
-    keyboard = create_address_keyboard(addresses, route_id)
+    # Формируем текст маршрута
+    route_text = f"🚛 *Маршрут {route_id+1}*\n\n"
+    for i, addr in enumerate(addresses, 1):
+        short_addr = addr.replace("Москва, ", "")
+        route_text += f"{i}. {short_addr}\n"
     
-    await callback.message.edit_text(
-        f"📋 *Маршрут {route_id+1}*\n"
-        f"Выберите адрес для перемещения:",
-        reply_markup=keyboard,
-        parse_mode="Markdown"
-    )
-    await callback.answer()
-
-@dp.callback_query(F.data.startswith("move_address_"))
-async def move_address_handler(callback: CallbackQuery, state: FSMContext):
-    user_id = callback.from_user.id
-    _, _, route_id, address_idx = callback.data.split("_")
-    route_id = int(route_id)
-    address_idx = int(address_idx)
-    
-    if user_id not in user_data:
-        await callback.answer("Ошибка данных")
-        return
-    
-    # Сохраняем выбранный адрес для перемещения
-    await state.update_data(
-        moving_address_idx=address_idx,
-        source_route_id=route_id
-    )
-    
-    # Показываем выбор целевого маршрута
-    routes = user_data[user_id]['routes_info']
+    # Кнопка для возврата
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(
-            text=f"Маршрут {i+1} ({len(info['addresses'])} адр.)",
-            callback_data=f"target_route_{i}"
-        )] for i, info in routes.items() if i != route_id
-    ] + [[InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_move")]])
+        [InlineKeyboardButton(text="◀️ Назад к маршрутам", callback_data="back_to_routes_list")]
+    ])
     
-    selected_address = routes[route_id]['addresses'][address_idx]
-    short_addr = selected_address.replace("Москва, ", "")[:40]
-    
-    await callback.message.edit_text(
-        f"📍 *Перемещение адреса:*\n{short_addr}\n\n"
-        f"Выберите маршрут, в который переместить:",
-        reply_markup=keyboard,
-        parse_mode="Markdown"
-    )
+    await callback.message.answer(route_text, reply_markup=keyboard, parse_mode="Markdown")
     await callback.answer()
 
-@dp.callback_query(F.data.startswith("target_route_"))
-async def target_route_handler(callback: CallbackQuery, state: FSMContext):
-    user_id = callback.from_user.id
-    target_route_id = int(callback.data.split("_")[-1])
-    
-    data = await state.get_data()
-    source_route_id = data.get('source_route_id')
-    address_idx = data.get('moving_address_idx')
-    
-    if not all([source_route_id is not None, address_idx is not None]):
-        await callback.answer("Ошибка данных")
-        return
-    
-    # Перемещаем адрес
-    source_route = user_data[user_id]['routes_info'][source_route_id]
-    target_route = user_data[user_id]['routes_info'][target_route_id]
-    
-    if address_idx < len(source_route['addresses']):
-        address = source_route['addresses'].pop(address_idx)
-        target_route['addresses'].append(address)
-        
-        await callback.answer(f"Адрес перемещен в маршрут {target_route_id+1}")
-        
-        # Обновляем отображение
-        routes = user_data[user_id]['routes_info']
-        keyboard = create_route_keyboard({i: info['addresses'] for i, info in routes.items()})
-        
-        await callback.message.edit_text(
-            "✅ *Адрес успешно перемещен!*\n\n"
-            "📋 *Выберите маршрут для редактирования:*",
-            reply_markup=keyboard,
-            parse_mode="Markdown"
-        )
-    
-    await state.clear()
+@dp.callback_query(F.data == "back_to_routes_list")
+async def back_to_routes_list_handler(callback: CallbackQuery):
+    await edit_routes_handler(callback)
 
-@dp.callback_query(F.data == "cancel_move")
-async def cancel_move_handler(callback: CallbackQuery, state: FSMContext):
+@dp.callback_query(F.data == "refresh_routes")
+async def refresh_routes_handler(callback: CallbackQuery):
     user_id = callback.from_user.id
-    routes = user_data[user_id]['routes_info']
-    
-    keyboard = create_route_keyboard({i: info['addresses'] for i, info in routes.items()})
-    
-    await callback.message.edit_text(
-        "📋 *Выберите маршрут для редактирования:*",
-        reply_markup=keyboard,
-        parse_mode="Markdown"
-    )
-    await callback.answer()
-    await state.clear()
-
-@dp.callback_query(F.data == "back_to_routes")
-async def back_to_routes_handler(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    routes = user_data[user_id]['routes_info']
-    
-    keyboard = create_route_keyboard({i: info['addresses'] for i, info in routes.items()})
-    
-    await callback.message.edit_text(
-        "📋 *Выберите маршрут для редактирования:*",
-        reply_markup=keyboard,
-        parse_mode="Markdown"
-    )
-    await callback.answer()
-
-@dp.callback_query(F.data == "show_stats")
-async def show_stats_handler(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    
-    if user_id not in user_data or 'routes_info' not in user_data[user_id]:
-        await callback.answer("Нет данных о маршрутах")
-        return
-    
-    routes_info = user_data[user_id]['routes_info']
-    
-    stats_text = "📊 *Статистика распределения:*\n\n"
-    total_addresses = 0
-    
-    for driver_id, info in sorted(routes_info.items()):
-        addresses = info['addresses']
-        total_addresses += len(addresses)
-        
-        stats_text += f"🚛 *Маршрут {driver_id+1}:*\n"
-        stats_text += f"   📍 Адресов: {len(addresses)}\n"
-        
-        # Если есть данные о маршруте
-        if 'route_data' in info and info['route_data']:
-            summary = info['route_data'].get('routes', [{}])[0].get('summary', {})
-            travel_time = summary.get('travelTimeInSeconds', 0) // 60
-            distance = summary.get('lengthInMeters', 0) / 1000
-            stats_text += f"   ⏱ Время: {travel_time} мин\n"
-            stats_text += f"   📏 Расстояние: {distance:.1f} км\n"
-        
-        stats_text += "\n"
-    
-    stats_text += f"📈 *Итого:* {total_addresses} адресов, {len(routes_info)} водителей"
-    
-    await callback.message.answer(stats_text, parse_mode="Markdown")
-    await callback.answer()
+    await show_routes(callback.message, user_id)
+    await callback.answer("Маршруты обновлены")
 
 @dp.callback_query(F.data == "finish_editing")
 async def finish_editing_handler(callback: CallbackQuery):
     user_id = callback.from_user.id
     
-    # Пересчитываем маршруты после редактирования
-    await callback.message.answer("🔄 *Пересчитываю маршруты после редактирования...*")
-    
-    routes_info = user_data[user_id]['routes_info']
-    address_coords = user_data[user_id]['address_coords']
-    production_coords = user_data[user_id]['production_coords']
-    departure_time = user_data[user_id]['departure_time']
-    
-    # Пересчитываем каждый маршрут
-    for driver_id, info in routes_info.items():
-        if info['addresses']:
-            waypoints = [production_coords]
-            for addr in info['addresses']:
-                if addr in address_coords:
-                    waypoints.append(address_coords[addr])
-            
-            # Пересчитываем маршрут
-            route_data = await tomtom_calculate_route(
-                waypoints, 
-                departure_time,
-                return_to_start=False
-            )
-            
-            info['route_data'] = route_data
-            info['waypoints'] = waypoints
-    
-    await show_routes(callback.message, user_id)
-    
     await callback.message.answer(
-        "✅ *Редактирование завершено!*\n"
-        "Маршруты пересчитаны с учетом изменений.",
+        "✅ *Распределение завершено!*\n\n"
+        "📋 *Доступные команды:*\n"
+        "/start - начать заново\n"
+        "/stats - показать статистику\n"
+        "/export - экспортировать маршруты",
         reply_markup=types.ReplyKeyboardRemove()
     )
     await callback.answer()
@@ -920,9 +996,6 @@ async def finish_editing_handler(callback: CallbackQuery):
 @dp.callback_query(F.data == "finish_distribution")
 async def finish_distribution_handler(callback: CallbackQuery):
     user_id = callback.from_user.id
-    
-    # Показываем финальные маршруты
-    await show_routes(callback.message, user_id)
     
     await callback.message.answer(
         "✅ *Распределение завершено!*\n\n"
@@ -942,37 +1015,7 @@ async def show_final_stats(message: types.Message):
         await message.answer("❌ Нет данных о маршрутах")
         return
     
-    routes_info = user_data[user_id]['routes_info']
-    
-    stats_text = "📊 *Финальная статистика:*\n\n"
-    total_time = 0
-    total_distance = 0
-    total_addresses = 0
-    
-    for driver_id, info in sorted(routes_info.items()):
-        addresses = info['addresses']
-        route_data = info.get('route_data', {})
-        
-        summary = route_data.get('routes', [{}])[0].get('summary', {})
-        travel_time = summary.get('travelTimeInSeconds', 0) // 60
-        distance = summary.get('lengthInMeters', 0) / 1000
-        
-        total_time += travel_time
-        total_distance += distance
-        total_addresses += len(addresses)
-        
-        stats_text += f"🚛 *Маршрут {driver_id+1}:*\n"
-        stats_text += f"   📍 Адресов: {len(addresses)}\n"
-        stats_text += f"   ⏱ Время: {travel_time} мин\n"
-        stats_text += f"   📏 Расстояние: {distance:.1f} км\n\n"
-    
-    stats_text += f"📈 *Итого по всем водителям:*\n"
-    stats_text += f"   📍 Адресов: {total_addresses}\n"
-    stats_text += f"   ⏱ Общее время: {total_time} мин ({total_time//60}ч {total_time%60}мин)\n"
-    stats_text += f"   📏 Общее расстояние: {total_distance:.1f} км\n"
-    stats_text += f"   🚛 Количество водителей: {len(routes_info)}"
-    
-    await message.answer(stats_text, parse_mode="Markdown")
+    await show_distribution_stats(message, user_id)
 
 @dp.message(Command("export"))
 async def export_routes(message: types.Message):
@@ -983,23 +1026,45 @@ async def export_routes(message: types.Message):
         return
     
     routes_info = user_data[user_id]['routes_info']
+    production_address = PRODUCTION_ADDRESS
     
     # Формируем текстовый файл с маршрутами
     export_text = "МАРШРУТЫ ДЛЯ ВОДИТЕЛЕЙ\n"
-    export_text += f"Адрес производства: {PRODUCTION_ADDRESS}\n"
+    export_text += f"Адрес производства: {production_address}\n"
     export_text += f"Время отправления: {user_data[user_id].get('departure_time', 'Не указано')}\n"
     export_text += "=" * 50 + "\n\n"
     
     for driver_id, info in sorted(routes_info.items()):
+        addresses = info['addresses']
+        
         export_text += f"МАРШРУТ {driver_id+1}\n"
+        export_text += f"Количество адресов: {len(addresses)}\n"
+        
+        if info.get('return_to_base'):
+            export_text += "Возврат на базу: ДА\n"
+        else:
+            export_text += "Возврат на базу: НЕТ\n"
+        
         export_text += "-" * 30 + "\n"
         
         # Адреса без города для водителей
-        for i, addr in enumerate(info['addresses'], 1):
+        for i, addr in enumerate(addresses, 1):
             short_addr = addr.replace("Москва, ", "")
             export_text += f"{i}. {short_addr}\n"
         
-        export_text += "\n"
+        # Информация о маршруте
+        route_data = info.get('route_data', {})
+        if route_data:
+            summary = route_data.get('routes', [{}])[0].get('summary', {})
+            travel_time = summary.get('travelTimeInSeconds', 0) // 60
+            distance = summary.get('lengthInMeters', 0) / 1000
+            
+            if travel_time > 0:
+                export_text += f"\nОриентировочное время: {travel_time} мин\n"
+            if distance > 0:
+                export_text += f"Ориентировочное расстояние: {distance:.1f} км\n"
+        
+        export_text += "\n" + "=" * 50 + "\n\n"
     
     # Сохраняем во временный файл
     filename = f"маршруты_{datetime.now().strftime('%Y%m%d_%H%M')}.txt"
